@@ -35,7 +35,7 @@ Static files: `/uploads/*`
 Data: `backend/data/*.json`
 
 ## Env
-Use `backend/.env.local` (or `backend/.env`):
+Use `backend/.env`:
 - `NANO_BANANO_API_KEY`
 - `NANO_BANANO_BASE_URL`
 - `NANO_BANANO_VEO_BASE_URL`

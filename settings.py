@@ -8,11 +8,8 @@ from dotenv import load_dotenv
 BACKEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BACKEND_DIR.parent
 
-# Load backend-local env first, then root-level fallback for compatibility.
-load_dotenv(BACKEND_DIR / ".env.local", override=False)
+# Single source of env config.
 load_dotenv(BACKEND_DIR / ".env", override=False)
-load_dotenv(ROOT_DIR / ".env.local", override=False)
-load_dotenv(ROOT_DIR / ".env", override=False)
 
 DATA_DIR = BACKEND_DIR / "data"
 LEGACY_DATA_DIR = ROOT_DIR / "data"
