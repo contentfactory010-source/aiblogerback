@@ -29,6 +29,17 @@ from .nano_banano import (
     get_video_status,
 )
 from .settings import PUBLIC_DIR, UPLOAD_API_BASE_URL
+from .upload_post import (
+    UploadPostError,
+    build_upload_post_username,
+    delete_user_profile,
+    ensure_user_profile,
+    generate_connect_url,
+    get_publish_status,
+    get_user_profile_or_none,
+    publish_video_url,
+    verify_api_key,
+)
 
 app = FastAPI(title="AI Influencer Backend", version="1.0.0")
 
@@ -136,9 +147,20 @@ def unauthorized_response(message: str = "Unauthorized") -> JSONResponse:
     return api_error(message, status=401)
 
 
+def current_user(request: Request) -> dict[str, Any]:
+    return as_record(getattr(request.state, "user", {}))
+
+
 def current_user_id(request: Request) -> str:
-    user = as_record(getattr(request.state, "user", {}))
+    user = current_user(request)
     return str(user.get("id") or "").strip()
+
+
+def upload_post_username_for_user(user: dict[str, Any]) -> str:
+    return build_upload_post_username(
+        user_id=str(user.get("id") or ""),
+        email=str(user.get("email") or ""),
+    )
 
 
 def is_owned_by_user(record: dict[str, Any] | None, user_id: str) -> bool:
@@ -199,6 +221,49 @@ class LoginRequest(BaseModel):
 
 class GoogleAuthRequest(BaseModel):
     idToken: str = Field(min_length=1)
+
+
+ConnectSocialPlatform = Literal[
+    "tiktok",
+    "instagram",
+    "linkedin",
+    "youtube",
+    "facebook",
+    "x",
+    "threads",
+]
+
+PublishSocialPlatform = Literal[
+    "tiktok",
+    "instagram",
+    "linkedin",
+    "youtube",
+    "facebook",
+    "x",
+    "threads",
+    "pinterest",
+    "bluesky",
+    "reddit",
+]
+
+
+class SocialConnectUrlRequest(BaseModel):
+    redirectUrl: str | None = None
+    redirectButtonText: str | None = None
+    connectTitle: str | None = None
+    connectDescription: str | None = None
+    platforms: list[ConnectSocialPlatform] | None = None
+    showCalendar: bool | None = None
+
+
+class SocialPublishVideoRequest(BaseModel):
+    videoId: str = Field(min_length=1)
+    platforms: list[PublishSocialPlatform]
+    title: str | None = None
+    description: str | None = None
+    scheduledDate: str | None = None
+    timezone: str | None = None
+    asyncUpload: bool = True
 
 
 PUBLIC_AUTH_PATHS = {
@@ -334,6 +399,192 @@ async def auth_me(request: Request) -> Any:
     except AuthError as exc:
         return unauthorized_response(str(exc))
     return {"user": sanitize_user(user)}
+
+
+@app.get("/api/social/accounts")
+async def social_accounts(request: Request) -> Any:
+    try:
+        user = current_user(request)
+        username = upload_post_username_for_user(user)
+        upload_post_account = await verify_api_key()
+        profile = await get_user_profile_or_none(username) or {}
+        return {
+            "username": username,
+            "socialAccounts": as_record(profile.get("social_accounts")),
+            "profile": profile,
+            "profileExists": bool(profile),
+            "uploadPostAccount": upload_post_account,
+        }
+    except UploadPostError as exc:
+        return api_error(
+            str(exc),
+            status=exc.status_code,
+            upstream=exc.upstream,
+        )
+    except Exception as exc:
+        return api_error(f"Failed to load social accounts: {exc}", status=500)
+
+
+@app.delete("/api/social/accounts")
+async def social_disconnect(request: Request) -> Any:
+    try:
+        user = current_user(request)
+        username = upload_post_username_for_user(user)
+        result = await delete_user_profile(username)
+        return {
+            "success": True,
+            "username": username,
+            "removed": True,
+            "result": result,
+        }
+    except UploadPostError as exc:
+        if exc.status_code == 404:
+            user = current_user(request)
+            username = upload_post_username_for_user(user)
+            return {
+                "success": True,
+                "username": username,
+                "removed": False,
+                "message": "Integration is already removed",
+            }
+        return api_error(
+            str(exc),
+            status=exc.status_code,
+            upstream=exc.upstream,
+        )
+    except Exception as exc:
+        return api_error(f"Failed to remove social integration: {exc}", status=500)
+
+
+@app.post("/api/social/connect-url")
+async def social_connect_url(
+    request: Request,
+    payload: SocialConnectUrlRequest | None = None,
+) -> Any:
+    try:
+        user = current_user(request)
+        username = upload_post_username_for_user(user)
+        connect_payload = payload or SocialConnectUrlRequest()
+        generated = await generate_connect_url(
+            username,
+            redirect_url=(
+                connect_payload.redirectUrl.strip()
+                if connect_payload.redirectUrl and connect_payload.redirectUrl.strip()
+                else request_origin(request)
+            ),
+            redirect_button_text=connect_payload.redirectButtonText,
+            connect_title=connect_payload.connectTitle,
+            connect_description=connect_payload.connectDescription,
+            platforms=connect_payload.platforms,
+            show_calendar=connect_payload.showCalendar,
+        )
+        access_url = str(generated.get("access_url") or "").strip()
+        if not access_url:
+            return api_error("Upload-Post access URL is empty", status=502, upstream=generated)
+        return {
+            "username": username,
+            "accessUrl": access_url,
+            "duration": generated.get("duration"),
+        }
+    except UploadPostError as exc:
+        return api_error(
+            str(exc),
+            status=exc.status_code,
+            upstream=exc.upstream,
+        )
+    except Exception as exc:
+        return api_error(f"Failed to generate connect URL: {exc}", status=500)
+
+
+@app.post("/api/social/publish-video")
+async def social_publish_video(payload: SocialPublishVideoRequest, request: Request) -> Any:
+    if len(payload.platforms) == 0:
+        return api_error("Нужно выбрать хотя бы одну платформу", status=400)
+
+    user = current_user(request)
+    user_id = str(user.get("id") or "").strip()
+    username = upload_post_username_for_user(user)
+
+    video = db.get_video_by_id(payload.videoId)
+    if not video or not is_owned_by_user(video, user_id):
+        return api_error("Video not found", status=404)
+
+    output_url = str(video.get("outputUrl") or "").strip()
+    if not output_url:
+        return api_error("Видео еще не готово для публикации", status=400)
+
+    try:
+        trimmed_title = (payload.title or "").strip()
+        default_title = (str(video.get("prompt") or "").strip() or "Generated video")[:220]
+        publish_result = await publish_video_url(
+            username=username,
+            video_url=output_url,
+            platforms=payload.platforms,
+            title=trimmed_title or default_title,
+            description=(payload.description or "").strip() or None,
+            scheduled_date=(payload.scheduledDate or "").strip() or None,
+            timezone=(payload.timezone or "").strip() or None,
+            async_upload=payload.asyncUpload,
+        )
+
+        request_id = str(publish_result.get("request_id") or "").strip()
+        job_id = str(publish_result.get("job_id") or "").strip()
+        publish_status = "completed"
+        if request_id:
+            publish_status = "processing"
+        elif job_id:
+            publish_status = "scheduled"
+
+        db.update_video(
+            payload.videoId,
+            {
+                "socialPublish": {
+                    "provider": "upload-post",
+                    "username": username,
+                    "platforms": payload.platforms,
+                    "requestId": request_id or None,
+                    "jobId": job_id or None,
+                    "status": publish_status,
+                    "response": publish_result,
+                    "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+            },
+        )
+
+        return {
+            "success": True,
+            "videoId": payload.videoId,
+            "requestId": request_id or None,
+            "jobId": job_id or None,
+            "status": publish_status,
+            "uploadPost": publish_result,
+        }
+    except UploadPostError as exc:
+        return api_error(
+            str(exc),
+            status=exc.status_code,
+            upstream=exc.upstream,
+        )
+    except Exception as exc:
+        return api_error(f"Failed to publish video: {exc}", status=500)
+
+
+@app.get("/api/social/publish-status")
+async def social_publish_status(
+    requestId: str | None = Query(default=None),
+    jobId: str | None = Query(default=None),
+) -> Any:
+    try:
+        payload = await get_publish_status(request_id=requestId, job_id=jobId)
+        return payload
+    except UploadPostError as exc:
+        return api_error(
+            str(exc),
+            status=exc.status_code,
+            upstream=exc.upstream,
+        )
+    except Exception as exc:
+        return api_error(f"Failed to fetch publish status: {exc}", status=500)
 
 
 @app.get("/api/bloggers")

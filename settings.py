@@ -16,6 +16,11 @@ LEGACY_DATA_DIR = ROOT_DIR / "data"
 PUBLIC_DIR = BACKEND_DIR / "public"
 
 UPLOAD_API_BASE_URL = os.getenv("UPLOAD_API_BASE_URL", "https://stage.neuro-x.online/api").rstrip("/")
+UPLOAD_POST_API_BASE_URL = os.getenv(
+    "UPLOAD_POST_API_BASE_URL",
+    "https://api.upload-post.com/api",
+).rstrip("/")
+UPLOAD_POST_API_KEY = os.getenv("UPLOAD_POST_API_KEY", "").strip()
 
 NANO_BANANO_API_KEY = os.getenv("NANO_BANANO_API_KEY", "")
 NANO_BANANO_BASE_URL = os.getenv("NANO_BANANO_BASE_URL", "https://api.kie.ai/api/v1").rstrip("/")
