@@ -6,7 +6,7 @@ import time
 from typing import Any, Literal
 
 import httpx
-from fastapi import FastAPI, File, Query, UploadFile
+from fastapi import FastAPI, File, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,14 +19,14 @@ from .nano_banano import (
     generate_video,
     get_video_status,
 )
-from .settings import FRONTEND_ORIGINS, PUBLIC_DIR, UPLOAD_API_BASE_URL
+from .settings import PUBLIC_DIR, UPLOAD_API_BASE_URL
 
 app = FastAPI(title="AI Influencer Backend", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=FRONTEND_ORIGINS or ["*"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,6 +44,20 @@ def api_error(message: str, status: int = 400, **extra: Any) -> JSONResponse:
 
 def as_record(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def request_origin(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
+
+
+def with_public_upload_urls(value: Any, origin: str) -> Any:
+    if isinstance(value, dict):
+        return {key: with_public_upload_urls(item, origin) for key, item in value.items()}
+    if isinstance(value, list):
+        return [with_public_upload_urls(item, origin) for item in value]
+    if isinstance(value, str) and value.startswith("/uploads/"):
+        return f"{origin}{value}"
+    return value
 
 
 def extract_uploaded_url(payload: Any) -> str | None:
@@ -113,15 +127,15 @@ class CreateVideoRequest(BaseModel):
 
 
 @app.get("/api/bloggers")
-async def get_bloggers() -> Any:
+async def get_bloggers(request: Request) -> Any:
     try:
-        return db.get_all_bloggers()
+        return with_public_upload_urls(db.get_all_bloggers(), request_origin(request))
     except Exception as exc:
         return api_error(f"Failed to fetch bloggers: {exc}", status=500)
 
 
 @app.post("/api/bloggers")
-async def create_blogger(payload: CreateBloggerRequest) -> Any:
+async def create_blogger(payload: CreateBloggerRequest, request: Request) -> Any:
     try:
         blogger = db.create_blogger(
             {
@@ -135,27 +149,27 @@ async def create_blogger(payload: CreateBloggerRequest) -> Any:
                 "relatives": [],
             }
         )
-        return blogger
+        return with_public_upload_urls(blogger, request_origin(request))
     except Exception as exc:
         return api_error(f"Failed to create blogger: {exc}", status=500)
 
 
 @app.get("/api/bloggers/{blogger_id}")
-async def get_blogger(blogger_id: str) -> Any:
+async def get_blogger(blogger_id: str, request: Request) -> Any:
     blogger = db.get_blogger_by_id(blogger_id)
     if not blogger:
         return api_error("Blogger not found", status=404)
-    return blogger
+    return with_public_upload_urls(blogger, request_origin(request))
 
 
 @app.patch("/api/bloggers/{blogger_id}")
-async def patch_blogger(blogger_id: str, body: dict[str, Any]) -> Any:
+async def patch_blogger(blogger_id: str, body: dict[str, Any], request: Request) -> Any:
     blogger = db.get_blogger_by_id(blogger_id)
     if not blogger:
         return api_error("Blogger not found", status=404)
 
     updated = db.update_blogger(blogger_id, body)
-    return updated
+    return with_public_upload_urls(updated, request_origin(request))
 
 
 @app.delete("/api/bloggers/{blogger_id}")
@@ -168,7 +182,11 @@ async def delete_blogger(blogger_id: str) -> Any:
 
 
 @app.post("/api/bloggers/{blogger_id}/create-in-nano")
-async def create_blogger_in_nano(blogger_id: str, payload: CreateInNanoRequest | None = None) -> Any:
+async def create_blogger_in_nano(
+    blogger_id: str,
+    request: Request,
+    payload: CreateInNanoRequest | None = None,
+) -> Any:
     blogger = db.get_blogger_by_id(blogger_id)
     if not blogger:
         return api_error("Blogger not found", status=404)
@@ -206,17 +224,20 @@ async def create_blogger_in_nano(blogger_id: str, payload: CreateInNanoRequest |
             },
         )
 
-        return {
+        return with_public_upload_urls(
+            {
             "success": True,
             "nanoBananoId": result.get("id"),
             "baseImage": base_image,
-        }
+            },
+            request_origin(request),
+        )
     except Exception as exc:
         return api_error(f"Failed to create in Nano Banano: {exc}", status=500)
 
 
 @app.post("/api/bloggers/{blogger_id}/looks")
-async def create_look(blogger_id: str, payload: CreateLookRequest) -> Any:
+async def create_look(blogger_id: str, payload: CreateLookRequest, request: Request) -> Any:
     blogger = db.get_blogger_by_id(blogger_id)
     if not blogger:
         return api_error("Blogger not found", status=404)
@@ -279,13 +300,13 @@ async def create_look(blogger_id: str, payload: CreateLookRequest) -> Any:
         ]
 
         updated = db.update_blogger(blogger_id, {"looks": next_looks})
-        return updated
+        return with_public_upload_urls(updated, request_origin(request))
     except Exception as exc:
         return api_error(f"Failed to create look: {exc}", status=500)
 
 
 @app.post("/api/bloggers/{blogger_id}/assets")
-async def create_asset(blogger_id: str, payload: CreateAssetRequest) -> Any:
+async def create_asset(blogger_id: str, payload: CreateAssetRequest, request: Request) -> Any:
     blogger = db.get_blogger_by_id(blogger_id)
     if not blogger:
         return api_error("Blogger not found", status=404)
@@ -317,24 +338,27 @@ async def create_asset(blogger_id: str, payload: CreateAssetRequest) -> Any:
         ]
 
         updated = db.update_blogger(blogger_id, {payload.category: next_collection})
-        return updated
+        return with_public_upload_urls(updated, request_origin(request))
     except Exception as exc:
         return api_error(f"Failed to create item: {exc}", status=500)
 
 
 @app.get("/api/videos")
-async def get_videos(bloggerId: str | None = Query(default=None)) -> Any:
+async def get_videos(request: Request, bloggerId: str | None = Query(default=None)) -> Any:
     try:
         all_videos = db.get_all_videos()
         if bloggerId:
-            return [item for item in all_videos if item.get("bloggerId") == bloggerId]
-        return all_videos
+            return with_public_upload_urls(
+                [item for item in all_videos if item.get("bloggerId") == bloggerId],
+                request_origin(request),
+            )
+        return with_public_upload_urls(all_videos, request_origin(request))
     except Exception as exc:
         return api_error(f"Failed to fetch videos: {exc}", status=500)
 
 
 @app.post("/api/videos")
-async def create_video(payload: CreateVideoRequest) -> Any:
+async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
     try:
         blogger = db.get_blogger_by_id(payload.bloggerId)
         if not blogger:
@@ -388,13 +412,13 @@ async def create_video(payload: CreateVideoRequest) -> Any:
             }
         )
 
-        return video
+        return with_public_upload_urls(video, request_origin(request))
     except Exception as exc:
         return api_error(str(exc), status=500)
 
 
 @app.get("/api/videos/{video_id}")
-async def get_video(video_id: str, refresh: str | None = Query(default=None)) -> Any:
+async def get_video(video_id: str, request: Request, refresh: str | None = Query(default=None)) -> Any:
     video = db.get_video_by_id(video_id)
     if not video:
         return api_error("Video not found", status=404)
@@ -416,7 +440,7 @@ async def get_video(video_id: str, refresh: str | None = Query(default=None)) ->
         except Exception as exc:
             return api_error(f"Failed to refresh video status: {exc}", status=500)
 
-    return video
+    return with_public_upload_urls(video, request_origin(request))
 
 
 @app.delete("/api/videos/{video_id}")
@@ -439,7 +463,7 @@ ALLOWED_VIDEO_TYPES = {
 
 
 @app.get("/api/trend-videos")
-async def get_trend_videos() -> list[dict[str, str]]:
+async def get_trend_videos(request: Request) -> list[dict[str, str]]:
     trends_dir = PUBLIC_DIR / "uploads" / "trends"
     if not trends_dir.exists():
         return []
@@ -452,10 +476,11 @@ async def get_trend_videos() -> list[dict[str, str]]:
     ]
     files.sort(key=lambda item: item.name.lower())
 
+    origin = request_origin(request)
     return [
         {
             "id": f"trend-{item.stem}",
-            "url": f"/uploads/trends/{item.name}",
+            "url": f"{origin}/uploads/trends/{item.name}",
         }
         for item in files
     ]
@@ -516,7 +541,7 @@ async def upload_file(file: UploadFile | None = File(default=None)) -> Any:
 
 
 @app.post("/api/upload-video")
-async def upload_video(file: UploadFile | None = File(default=None)) -> Any:
+async def upload_video(request: Request, file: UploadFile | None = File(default=None)) -> Any:
     if file is None:
         return api_error("File is required", status=400)
 
@@ -535,7 +560,7 @@ async def upload_video(file: UploadFile | None = File(default=None)) -> Any:
         file_path = uploads_motion_dir / safe_name
         file_path.write_bytes(await file.read())
 
-        return {"url": f"/uploads/motion/{safe_name}"}
+        return {"url": f"{request_origin(request)}/uploads/motion/{safe_name}"}
     except Exception as exc:
         return api_error(f"Upload failed: {exc}", status=500)
 
