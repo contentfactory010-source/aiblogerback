@@ -12,6 +12,15 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .auth import (
+    AuthError,
+    get_user_by_access_token,
+    hash_password,
+    issue_token_for_user,
+    sanitize_user,
+    verify_google_id_token,
+    verify_password,
+)
 from .db import db, nanoid
 from .nano_banano import (
     create_character,
@@ -87,6 +96,57 @@ def is_valid_reference_link(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
 
+def normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
+def is_valid_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value))
+
+
+def validate_password_rules(value: str) -> str | None:
+    if len(value) < 8:
+        return "Пароль должен содержать минимум 8 символов"
+    if len(value) > 128:
+        return "Пароль должен содержать максимум 128 символов"
+    if re.search(r"\s", value):
+        return "Пароль не должен содержать пробелы"
+    if not re.search(r"[a-z]", value):
+        return "Пароль должен содержать хотя бы одну строчную букву"
+    if not re.search(r"[A-Z]", value):
+        return "Пароль должен содержать хотя бы одну заглавную букву"
+    if not re.search(r"\d", value):
+        return "Пароль должен содержать хотя бы одну цифру"
+    if not re.search(r"[^A-Za-z0-9]", value):
+        return "Пароль должен содержать хотя бы один спецсимвол"
+    return None
+
+
+def extract_bearer_token(authorization_header: str | None) -> str | None:
+    if not authorization_header:
+        return None
+    kind, _, token = authorization_header.partition(" ")
+    if kind.lower() != "bearer":
+        return None
+    clean_token = token.strip()
+    return clean_token or None
+
+
+def unauthorized_response(message: str = "Unauthorized") -> JSONResponse:
+    return api_error(message, status=401)
+
+
+def current_user_id(request: Request) -> str:
+    user = as_record(getattr(request.state, "user", {}))
+    return str(user.get("id") or "").strip()
+
+
+def is_owned_by_user(record: dict[str, Any] | None, user_id: str) -> bool:
+    if not isinstance(record, dict):
+        return False
+    return str(record.get("ownerUserId") or "").strip() == user_id
+
+
 class CreateBloggerRequest(BaseModel):
     name: str = Field(min_length=1)
     prompt: str = Field(min_length=1)
@@ -126,10 +186,166 @@ class CreateVideoRequest(BaseModel):
     aspectRatio: Literal["16:9", "9:16", "Auto"] | None = None
 
 
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=128)
+    name: str | None = None
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class GoogleAuthRequest(BaseModel):
+    idToken: str = Field(min_length=1)
+
+
+PUBLIC_AUTH_PATHS = {
+    "/api/auth/register",
+    "/api/auth/login",
+    "/api/auth/google",
+}
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next: Any) -> Any:
+    path = request.url.path
+    normalized_path = path.rstrip("/") or "/"
+
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    if path == "/health" or path.startswith("/uploads/"):
+        return await call_next(request)
+
+    if not path.startswith("/api/"):
+        return await call_next(request)
+
+    if normalized_path in PUBLIC_AUTH_PATHS:
+        return await call_next(request)
+
+    token = extract_bearer_token(request.headers.get("Authorization"))
+    if not token:
+        return unauthorized_response("Missing bearer token")
+
+    try:
+        user = get_user_by_access_token(token)
+    except AuthError as exc:
+        return unauthorized_response(str(exc))
+
+    request.state.user = sanitize_user(user)
+    return await call_next(request)
+
+
+@app.post("/api/auth/register")
+async def auth_register(payload: RegisterRequest) -> Any:
+    email = normalize_email(payload.email)
+    if not is_valid_email(email):
+        return api_error("Invalid email format", status=400)
+
+    password_error = validate_password_rules(payload.password)
+    if password_error:
+        return api_error(password_error, status=400)
+
+    existing = db.get_user_by_email(email)
+    if existing:
+        return api_error("User with this email already exists", status=409)
+
+    user = db.create_user(
+        {
+            "email": email,
+            "name": (payload.name or "").strip() or email.split("@")[0],
+            "passwordHash": hash_password(payload.password),
+            "provider": "local",
+        }
+    )
+    token = issue_token_for_user(user)
+    return {
+        "token": token,
+        "user": sanitize_user(user),
+    }
+
+
+@app.post("/api/auth/login")
+async def auth_login(payload: LoginRequest) -> Any:
+    email = normalize_email(payload.email)
+    user = db.get_user_by_email(email)
+    if not user:
+        return api_error("Invalid email or password", status=401)
+
+    password_hash = str(user.get("passwordHash") or "")
+    if not password_hash:
+        return api_error("Use Google login for this account", status=400)
+
+    if not verify_password(payload.password, password_hash):
+        return api_error("Invalid email or password", status=401)
+
+    token = issue_token_for_user(user)
+    return {
+        "token": token,
+        "user": sanitize_user(user),
+    }
+
+
+@app.post("/api/auth/google")
+async def auth_google(payload: GoogleAuthRequest) -> Any:
+    try:
+        google_user = await verify_google_id_token(payload.idToken)
+    except AuthError as exc:
+        return api_error(str(exc), status=401)
+
+    user = db.get_user_by_google_sub(google_user["sub"])
+    if not user:
+        user = db.get_user_by_email(google_user["email"])
+
+    if user:
+        update_payload: dict[str, Any] = {
+            "name": google_user["name"] or user.get("name"),
+            "googleSub": google_user["sub"],
+            "email": google_user["email"],
+            "provider": "google",
+        }
+        user = db.update_user(str(user.get("id")), update_payload) or user
+    else:
+        user = db.create_user(
+            {
+                "email": google_user["email"],
+                "name": google_user["name"] or google_user["email"].split("@")[0],
+                "googleSub": google_user["sub"],
+                "provider": "google",
+            }
+        )
+
+    token = issue_token_for_user(user)
+    return {
+        "token": token,
+        "user": sanitize_user(user),
+    }
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request) -> Any:
+    token = extract_bearer_token(request.headers.get("Authorization"))
+    if not token:
+        return unauthorized_response("Missing bearer token")
+    try:
+        user = get_user_by_access_token(token)
+    except AuthError as exc:
+        return unauthorized_response(str(exc))
+    return {"user": sanitize_user(user)}
+
+
 @app.get("/api/bloggers")
 async def get_bloggers(request: Request) -> Any:
     try:
-        return with_public_upload_urls(db.get_all_bloggers(), request_origin(request))
+        user_id = current_user_id(request)
+        owned_bloggers = [
+            item
+            for item in db.get_all_bloggers()
+            if is_owned_by_user(item, user_id)
+        ]
+        return with_public_upload_urls(owned_bloggers, request_origin(request))
     except Exception as exc:
         return api_error(f"Failed to fetch bloggers: {exc}", status=500)
 
@@ -137,11 +353,13 @@ async def get_bloggers(request: Request) -> Any:
 @app.post("/api/bloggers")
 async def create_blogger(payload: CreateBloggerRequest, request: Request) -> Any:
     try:
+        user_id = current_user_id(request)
         blogger = db.create_blogger(
             {
                 "name": payload.name,
                 "prompt": payload.prompt,
                 "baseImage": payload.baseImage,
+                "ownerUserId": user_id,
                 "looks": [],
                 "clothes": [],
                 "home": [],
@@ -156,24 +374,31 @@ async def create_blogger(payload: CreateBloggerRequest, request: Request) -> Any
 
 @app.get("/api/bloggers/{blogger_id}")
 async def get_blogger(blogger_id: str, request: Request) -> Any:
+    user_id = current_user_id(request)
     blogger = db.get_blogger_by_id(blogger_id)
-    if not blogger:
+    if not blogger or not is_owned_by_user(blogger, user_id):
         return api_error("Blogger not found", status=404)
     return with_public_upload_urls(blogger, request_origin(request))
 
 
 @app.patch("/api/bloggers/{blogger_id}")
 async def patch_blogger(blogger_id: str, body: dict[str, Any], request: Request) -> Any:
+    user_id = current_user_id(request)
     blogger = db.get_blogger_by_id(blogger_id)
-    if not blogger:
+    if not blogger or not is_owned_by_user(blogger, user_id):
         return api_error("Blogger not found", status=404)
 
-    updated = db.update_blogger(blogger_id, body)
+    safe_patch = {key: value for key, value in body.items() if key != "ownerUserId"}
+    updated = db.update_blogger(blogger_id, safe_patch)
     return with_public_upload_urls(updated, request_origin(request))
 
 
 @app.delete("/api/bloggers/{blogger_id}")
-async def delete_blogger(blogger_id: str) -> Any:
+async def delete_blogger(blogger_id: str, request: Request) -> Any:
+    user_id = current_user_id(request)
+    blogger = db.get_blogger_by_id(blogger_id)
+    if not blogger or not is_owned_by_user(blogger, user_id):
+        return api_error("Blogger not found", status=404)
     db.delete_videos_by_blogger_id(blogger_id)
     deleted = db.delete_blogger(blogger_id)
     if not deleted:
@@ -187,8 +412,9 @@ async def create_blogger_in_nano(
     request: Request,
     payload: CreateInNanoRequest | None = None,
 ) -> Any:
+    user_id = current_user_id(request)
     blogger = db.get_blogger_by_id(blogger_id)
-    if not blogger:
+    if not blogger or not is_owned_by_user(blogger, user_id):
         return api_error("Blogger not found", status=404)
 
     try:
@@ -238,8 +464,9 @@ async def create_blogger_in_nano(
 
 @app.post("/api/bloggers/{blogger_id}/looks")
 async def create_look(blogger_id: str, payload: CreateLookRequest, request: Request) -> Any:
+    user_id = current_user_id(request)
     blogger = db.get_blogger_by_id(blogger_id)
-    if not blogger:
+    if not blogger or not is_owned_by_user(blogger, user_id):
         return api_error("Blogger not found", status=404)
 
     try:
@@ -307,8 +534,9 @@ async def create_look(blogger_id: str, payload: CreateLookRequest, request: Requ
 
 @app.post("/api/bloggers/{blogger_id}/assets")
 async def create_asset(blogger_id: str, payload: CreateAssetRequest, request: Request) -> Any:
+    user_id = current_user_id(request)
     blogger = db.get_blogger_by_id(blogger_id)
-    if not blogger:
+    if not blogger or not is_owned_by_user(blogger, user_id):
         return api_error("Blogger not found", status=404)
 
     if payload.action == "upload" and not payload.imageUrl:
@@ -346,7 +574,12 @@ async def create_asset(blogger_id: str, payload: CreateAssetRequest, request: Re
 @app.get("/api/videos")
 async def get_videos(request: Request, bloggerId: str | None = Query(default=None)) -> Any:
     try:
-        all_videos = db.get_all_videos()
+        user_id = current_user_id(request)
+        all_videos = [
+            item
+            for item in db.get_all_videos()
+            if is_owned_by_user(item, user_id)
+        ]
         if bloggerId:
             return with_public_upload_urls(
                 [item for item in all_videos if item.get("bloggerId") == bloggerId],
@@ -360,8 +593,9 @@ async def get_videos(request: Request, bloggerId: str | None = Query(default=Non
 @app.post("/api/videos")
 async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
     try:
+        user_id = current_user_id(request)
         blogger = db.get_blogger_by_id(payload.bloggerId)
-        if not blogger:
+        if not blogger or not is_owned_by_user(blogger, user_id):
             return api_error("Blogger not found", status=404)
 
         resolved_reference_image = payload.referenceImage
@@ -404,6 +638,7 @@ async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
             {
                 "externalTaskId": nb_result.get("id"),
                 "bloggerId": payload.bloggerId,
+                "ownerUserId": user_id,
                 "type": payload.type,
                 "prompt": trimmed_prompt,
                 "lookId": payload.lookId,
@@ -419,8 +654,9 @@ async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
 
 @app.get("/api/videos/{video_id}")
 async def get_video(video_id: str, request: Request, refresh: str | None = Query(default=None)) -> Any:
+    user_id = current_user_id(request)
     video = db.get_video_by_id(video_id)
-    if not video:
+    if not video or not is_owned_by_user(video, user_id):
         return api_error("Video not found", status=404)
 
     should_refresh = refresh == "1"
@@ -444,8 +680,12 @@ async def get_video(video_id: str, request: Request, refresh: str | None = Query
 
 
 @app.delete("/api/videos/{video_id}")
-async def delete_video(video_id: str) -> Any:
+async def delete_video(video_id: str, request: Request) -> Any:
     try:
+        user_id = current_user_id(request)
+        video = db.get_video_by_id(video_id)
+        if not video or not is_owned_by_user(video, user_id):
+            return api_error("Video not found", status=404)
         deleted = db.delete_video(video_id)
         if not deleted:
             return api_error("Video not found", status=404)
@@ -498,10 +738,26 @@ def extension_from_mime_type(mime_type: str) -> str:
     return "mp4"
 
 
+ALLOWED_IMAGE_TYPES = {
+    "image/png",
+    "image/webp",
+    "image/jpg",
+    "image/heif",
+    "image/avif",
+    "image/jpeg",
+    "image/gif",
+}
+
+
 @app.post("/api/upload")
 async def upload_file(file: UploadFile | None = File(default=None)) -> Any:
     if file is None:
         return api_error("File is required", status=400)
+    if file.content_type and file.content_type not in ALLOWED_IMAGE_TYPES:
+        return api_error(
+            "Unsupported image type. Allowed: image/png, image/webp, image/jpg, image/heif, image/avif, image/jpeg, image/gif",
+            status=400,
+        )
 
     try:
         file_content = await file.read()

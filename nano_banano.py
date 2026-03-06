@@ -151,7 +151,7 @@ def _parse_json_string(value: str) -> Any:
 
 
 def _collect_http_urls(value: Any, acc: list[str] | None = None) -> list[str]:
-    result = acc or []
+    result = acc if acc is not None else []
     if isinstance(value, str):
         parsed = _parse_json_string(value)
         if parsed is not None:

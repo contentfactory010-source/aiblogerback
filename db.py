@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import sqlite3
 import string
 import threading
 from datetime import datetime, timezone
@@ -10,8 +11,10 @@ from typing import Any
 
 from .settings import DATA_DIR, LEGACY_DATA_DIR
 
+DB_FILE = DATA_DIR / "app.db"
 BLOGGERS_FILE = DATA_DIR / "bloggers.json"
 VIDEOS_FILE = DATA_DIR / "videos.json"
+USERS_FILE = DATA_DIR / "users.json"
 
 _ID_ALPHABET = string.ascii_letters + string.digits
 
@@ -35,62 +38,161 @@ def normalize_blogger_record(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-class JsonDB:
+def _read_legacy_json(file_path: Path) -> list[dict[str, Any]]:
+    if not file_path.exists():
+        return []
+    try:
+        raw = file_path.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            return []
+        return [item for item in parsed if isinstance(item, dict)]
+    except Exception:
+        return []
+
+
+class SQLiteDB:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._migrated_legacy_data = False
+        self._conn: sqlite3.Connection | None = None
+        self._ready = False
 
-    def _ensure_data_dir(self) -> None:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if self._migrated_legacy_data:
+    def _connect(self) -> sqlite3.Connection:
+        if self._conn is None:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+        return self._conn
+
+    def _serialize(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _deserialize(self, payload: str) -> dict[str, Any]:
+        try:
+            parsed = json.loads(payload)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _ensure_schema_and_migration(self) -> None:
+        if self._ready:
             return
 
-        legacy_files = {
-            BLOGGERS_FILE: LEGACY_DATA_DIR / "bloggers.json",
-            VIDEOS_FILE: LEGACY_DATA_DIR / "videos.json",
-        }
-        for target_file, legacy_file in legacy_files.items():
-            if target_file.exists() or not legacy_file.exists():
-                continue
-            try:
-                target_file.write_bytes(legacy_file.read_bytes())
-            except Exception:
-                # Keep going; backend can still start with empty storage.
-                continue
+        conn = self._connect()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bloggers (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS videos (
+                id TEXT PRIMARY KEY,
+                blogger_id TEXT,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_blogger_id ON videos(blogger_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT,
+                google_sub TEXT,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)")
 
-        self._migrated_legacy_data = True
+        self._migrate_from_legacy_json(conn)
+        conn.commit()
+        self._ready = True
 
-    def _read_json(self, file_path: Path) -> list[dict[str, Any]]:
-        self._ensure_data_dir()
-        if not file_path.exists():
-            return []
-        try:
-            raw = file_path.read_text(encoding="utf-8")
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, list) else []
-        except Exception:
-            return []
+    def _table_is_empty(self, conn: sqlite3.Connection, table: str) -> bool:
+        row = conn.execute(f"SELECT COUNT(1) AS cnt FROM {table}").fetchone()
+        return int(row["cnt"] if row and row["cnt"] is not None else 0) == 0
 
-    def _write_json(self, file_path: Path, payload: list[dict[str, Any]]) -> None:
-        self._ensure_data_dir()
-        file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _pick_legacy_file(self, primary: Path, secondary: Path) -> Path | None:
+        if primary.exists():
+            return primary
+        if secondary.exists():
+            return secondary
+        return None
+
+    def _migrate_from_legacy_json(self, conn: sqlite3.Connection) -> None:
+        bloggers_legacy = self._pick_legacy_file(BLOGGERS_FILE, LEGACY_DATA_DIR / "bloggers.json")
+        videos_legacy = self._pick_legacy_file(VIDEOS_FILE, LEGACY_DATA_DIR / "videos.json")
+        users_legacy = self._pick_legacy_file(USERS_FILE, LEGACY_DATA_DIR / "users.json")
+
+        if self._table_is_empty(conn, "bloggers") and bloggers_legacy:
+            for item in _read_legacy_json(bloggers_legacy):
+                blogger = normalize_blogger_record(item)
+                blogger_id = str(blogger.get("id") or nanoid())
+                blogger = {**blogger, "id": blogger_id}
+                created_at = str(blogger.get("createdAt") or now_iso())
+                conn.execute(
+                    "INSERT OR REPLACE INTO bloggers (id, payload, created_at) VALUES (?, ?, ?)",
+                    (blogger_id, self._serialize(blogger), created_at),
+                )
+
+        if self._table_is_empty(conn, "videos") and videos_legacy:
+            for item in _read_legacy_json(videos_legacy):
+                video_id = str(item.get("id") or nanoid())
+                video = {**item, "id": video_id}
+                created_at = str(video.get("createdAt") or now_iso())
+                blogger_id = str(video.get("bloggerId") or "") or None
+                conn.execute(
+                    "INSERT OR REPLACE INTO videos (id, blogger_id, payload, created_at) VALUES (?, ?, ?, ?)",
+                    (video_id, blogger_id, self._serialize(video), created_at),
+                )
+
+        if self._table_is_empty(conn, "users") and users_legacy:
+            for item in _read_legacy_json(users_legacy):
+                user_id = str(item.get("id") or nanoid())
+                user = {**item, "id": user_id}
+                created_at = str(user.get("createdAt") or now_iso())
+                email = str(user.get("email") or "").strip().lower() or None
+                google_sub = str(user.get("googleSub") or "").strip() or None
+                conn.execute(
+                    "INSERT OR REPLACE INTO users (id, email, google_sub, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (user_id, email, google_sub, self._serialize(user), created_at),
+                )
+
+    def _row_payload(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return self._deserialize(str(row["payload"]))
 
     def get_all_bloggers(self) -> list[dict[str, Any]]:
         with self._lock:
-            bloggers = self._read_json(BLOGGERS_FILE)
-            return [normalize_blogger_record(item) for item in bloggers if isinstance(item, dict)]
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            rows = conn.execute("SELECT payload FROM bloggers ORDER BY created_at ASC").fetchall()
+            return [normalize_blogger_record(self._deserialize(str(row["payload"]))) for row in rows]
 
     def get_blogger_by_id(self, blogger_id: str) -> dict[str, Any] | None:
-        bloggers = self.get_all_bloggers()
-        return next((item for item in bloggers if item.get("id") == blogger_id), None)
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            row = conn.execute("SELECT payload FROM bloggers WHERE id = ?", (blogger_id,)).fetchone()
+            payload = self._row_payload(row)
+            return normalize_blogger_record(payload) if isinstance(payload, dict) else None
 
     def create_blogger(self, data: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            bloggers = [
-                normalize_blogger_record(item)
-                for item in self._read_json(BLOGGERS_FILE)
-                if isinstance(item, dict)
-            ]
+            self._ensure_schema_and_migration()
+            conn = self._connect()
             blogger = normalize_blogger_record(
                 {
                     **data,
@@ -98,51 +200,57 @@ class JsonDB:
                     "createdAt": now_iso(),
                 }
             )
-            bloggers.append(blogger)
-            self._write_json(BLOGGERS_FILE, bloggers)
+            conn.execute(
+                "INSERT INTO bloggers (id, payload, created_at) VALUES (?, ?, ?)",
+                (str(blogger["id"]), self._serialize(blogger), str(blogger["createdAt"])),
+            )
+            conn.commit()
             return blogger
 
     def update_blogger(self, blogger_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
         with self._lock:
-            bloggers = [
-                normalize_blogger_record(item)
-                for item in self._read_json(BLOGGERS_FILE)
-                if isinstance(item, dict)
-            ]
-            for index, blogger in enumerate(bloggers):
-                if blogger.get("id") != blogger_id:
-                    continue
-                updated = normalize_blogger_record({**blogger, **data})
-                bloggers[index] = updated
-                self._write_json(BLOGGERS_FILE, bloggers)
-                return updated
-            return None
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            row = conn.execute("SELECT payload FROM bloggers WHERE id = ?", (blogger_id,)).fetchone()
+            current = self._row_payload(row)
+            if not isinstance(current, dict):
+                return None
+
+            updated = normalize_blogger_record({**current, **data, "id": blogger_id})
+            created_at = str(updated.get("createdAt") or current.get("createdAt") or now_iso())
+            conn.execute(
+                "UPDATE bloggers SET payload = ?, created_at = ? WHERE id = ?",
+                (self._serialize(updated), created_at, blogger_id),
+            )
+            conn.commit()
+            return updated
 
     def delete_blogger(self, blogger_id: str) -> bool:
         with self._lock:
-            bloggers = [
-                normalize_blogger_record(item)
-                for item in self._read_json(BLOGGERS_FILE)
-                if isinstance(item, dict)
-            ]
-            filtered = [item for item in bloggers if item.get("id") != blogger_id]
-            if len(filtered) == len(bloggers):
-                return False
-            self._write_json(BLOGGERS_FILE, filtered)
-            return True
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            cur = conn.execute("DELETE FROM bloggers WHERE id = ?", (blogger_id,))
+            conn.commit()
+            return cur.rowcount > 0
 
     def get_all_videos(self) -> list[dict[str, Any]]:
         with self._lock:
-            videos = self._read_json(VIDEOS_FILE)
-            return [item for item in videos if isinstance(item, dict)]
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            rows = conn.execute("SELECT payload FROM videos ORDER BY created_at ASC").fetchall()
+            return [self._deserialize(str(row["payload"])) for row in rows]
 
     def get_video_by_id(self, video_id: str) -> dict[str, Any] | None:
-        videos = self.get_all_videos()
-        return next((item for item in videos if item.get("id") == video_id), None)
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            row = conn.execute("SELECT payload FROM videos WHERE id = ?", (video_id,)).fetchone()
+            return self._row_payload(row)
 
     def create_video(self, data: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            videos = [item for item in self._read_json(VIDEOS_FILE) if isinstance(item, dict)]
+            self._ensure_schema_and_migration()
+            conn = self._connect()
             now = now_iso()
             video = {
                 **data,
@@ -150,43 +258,140 @@ class JsonDB:
                 "createdAt": now,
                 "updatedAt": now,
             }
-            videos.append(video)
-            self._write_json(VIDEOS_FILE, videos)
+            conn.execute(
+                "INSERT INTO videos (id, blogger_id, payload, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    str(video["id"]),
+                    str(video.get("bloggerId") or "") or None,
+                    self._serialize(video),
+                    str(video["createdAt"]),
+                ),
+            )
+            conn.commit()
             return video
 
     def update_video(self, video_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
         with self._lock:
-            videos = [item for item in self._read_json(VIDEOS_FILE) if isinstance(item, dict)]
-            for index, video in enumerate(videos):
-                if video.get("id") != video_id:
-                    continue
-                updated = {
-                    **video,
-                    **data,
-                    "updatedAt": now_iso(),
-                }
-                videos[index] = updated
-                self._write_json(VIDEOS_FILE, videos)
-                return updated
-            return None
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            row = conn.execute("SELECT payload FROM videos WHERE id = ?", (video_id,)).fetchone()
+            current = self._row_payload(row)
+            if not isinstance(current, dict):
+                return None
+
+            updated = {
+                **current,
+                **data,
+                "id": video_id,
+                "updatedAt": now_iso(),
+            }
+            created_at = str(updated.get("createdAt") or current.get("createdAt") or now_iso())
+            conn.execute(
+                "UPDATE videos SET blogger_id = ?, payload = ?, created_at = ? WHERE id = ?",
+                (
+                    str(updated.get("bloggerId") or "") or None,
+                    self._serialize(updated),
+                    created_at,
+                    video_id,
+                ),
+            )
+            conn.commit()
+            return updated
 
     def delete_video(self, video_id: str) -> bool:
         with self._lock:
-            videos = [item for item in self._read_json(VIDEOS_FILE) if isinstance(item, dict)]
-            filtered = [item for item in videos if item.get("id") != video_id]
-            if len(filtered) == len(videos):
-                return False
-            self._write_json(VIDEOS_FILE, filtered)
-            return True
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            cur = conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
+            conn.commit()
+            return cur.rowcount > 0
 
     def delete_videos_by_blogger_id(self, blogger_id: str) -> int:
         with self._lock:
-            videos = [item for item in self._read_json(VIDEOS_FILE) if isinstance(item, dict)]
-            filtered = [item for item in videos if item.get("bloggerId") != blogger_id]
-            deleted_count = len(videos) - len(filtered)
-            if deleted_count > 0:
-                self._write_json(VIDEOS_FILE, filtered)
-            return deleted_count
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            cur = conn.execute("DELETE FROM videos WHERE blogger_id = ?", (blogger_id,))
+            conn.commit()
+            return cur.rowcount
+
+    def get_all_users(self) -> list[dict[str, Any]]:
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            rows = conn.execute("SELECT payload FROM users ORDER BY created_at ASC").fetchall()
+            return [self._deserialize(str(row["payload"])) for row in rows]
+
+    def get_user_by_id(self, user_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            row = conn.execute("SELECT payload FROM users WHERE id = ?", (user_id,)).fetchone()
+            return self._row_payload(row)
+
+    def get_user_by_email(self, email: str) -> dict[str, Any] | None:
+        normalized_email = str(email).strip().lower()
+        if not normalized_email:
+            return None
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            row = conn.execute("SELECT payload FROM users WHERE email = ?", (normalized_email,)).fetchone()
+            return self._row_payload(row)
+
+    def get_user_by_google_sub(self, google_sub: str) -> dict[str, Any] | None:
+        normalized_sub = str(google_sub).strip()
+        if not normalized_sub:
+            return None
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            row = conn.execute("SELECT payload FROM users WHERE google_sub = ?", (normalized_sub,)).fetchone()
+            return self._row_payload(row)
+
+    def create_user(self, data: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            now = now_iso()
+            user = {
+                **data,
+                "id": nanoid(),
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            email = str(user.get("email") or "").strip().lower() or None
+            google_sub = str(user.get("googleSub") or "").strip() or None
+            conn.execute(
+                "INSERT INTO users (id, email, google_sub, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (str(user["id"]), email, google_sub, self._serialize(user), str(user["createdAt"])),
+            )
+            conn.commit()
+            return user
+
+    def update_user(self, user_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            row = conn.execute("SELECT payload FROM users WHERE id = ?", (user_id,)).fetchone()
+            current = self._row_payload(row)
+            if not isinstance(current, dict):
+                return None
+
+            updated = {
+                **current,
+                **data,
+                "id": user_id,
+                "updatedAt": now_iso(),
+            }
+            created_at = str(updated.get("createdAt") or current.get("createdAt") or now_iso())
+            email = str(updated.get("email") or "").strip().lower() or None
+            google_sub = str(updated.get("googleSub") or "").strip() or None
+            conn.execute(
+                "UPDATE users SET email = ?, google_sub = ?, payload = ?, created_at = ? WHERE id = ?",
+                (email, google_sub, self._serialize(updated), created_at, user_id),
+            )
+            conn.commit()
+            return updated
 
 
-db = JsonDB()
+db = SQLiteDB()
