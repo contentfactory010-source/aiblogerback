@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, File, Query, Request, UploadFile
@@ -32,6 +33,7 @@ from .nano_banano import (
 )
 from .settings import (
     FRONTEND_APP_URL,
+    FRONTEND_ORIGINS,
     PUBLIC_DIR,
     STRIPE_CHECKOUT_CANCEL_URL,
     STRIPE_CHECKOUT_SUCCESS_URL,
@@ -266,16 +268,45 @@ def token_settings_payload() -> dict[str, Any]:
     }
 
 
+def normalize_http_origin(value: str | None) -> str:
+    raw = (value or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def checkout_frontend_root(request: Request) -> str:
+    allowed_origins = {
+        normalize_http_origin(item)
+        for item in [*FRONTEND_ORIGINS, FRONTEND_APP_URL]
+        if normalize_http_origin(item)
+    }
+    request_origins = [
+        normalize_http_origin(request.headers.get("origin")),
+        normalize_http_origin(request.headers.get("referer")),
+    ]
+    for origin in request_origins:
+        if origin and (len(allowed_origins) == 0 or origin in allowed_origins):
+            return origin
+    return normalize_http_origin(FRONTEND_APP_URL) or request_origin(request)
+
+
 def default_checkout_success_url(request: Request) -> str:
-    root = FRONTEND_APP_URL or request_origin(request)
+    root = checkout_frontend_root(request)
     return (
-        f"{root.rstrip('/')}/cabinet?checkout=success&session_id={{CHECKOUT_SESSION_ID}}"
+        f"{root.rstrip('/')}/billing?checkout=success&session_id={{CHECKOUT_SESSION_ID}}"
     )
 
 
 def default_checkout_cancel_url(request: Request) -> str:
-    root = FRONTEND_APP_URL or request_origin(request)
-    return f"{root.rstrip('/')}/cabinet?checkout=cancel"
+    root = checkout_frontend_root(request)
+    return f"{root.rstrip('/')}/billing?checkout=cancel"
 
 
 @dataclass
