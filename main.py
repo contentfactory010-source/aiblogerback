@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 import httpx
@@ -28,13 +30,28 @@ from .nano_banano import (
     generate_video,
     get_video_status,
 )
-from .settings import PUBLIC_DIR, UPLOAD_API_BASE_URL
+from .settings import (
+    FRONTEND_APP_URL,
+    PUBLIC_DIR,
+    STRIPE_CHECKOUT_CANCEL_URL,
+    STRIPE_CHECKOUT_SUCCESS_URL,
+    STRIPE_TOKEN_PRICE_CENTS,
+    TOKEN_COST_PHOTO,
+    TOKEN_COST_VIDEO,
+    UPLOAD_API_BASE_URL,
+)
+from .stripe_billing import (
+    StripeBillingError,
+    create_checkout_session,
+    verify_and_parse_webhook,
+)
 from .upload_post import (
     UploadPostError,
     build_upload_post_username,
     delete_user_profile,
     ensure_user_profile,
     generate_connect_url,
+    publish_photo_urls,
     get_publish_status,
     get_user_profile_or_none,
     publish_video_url,
@@ -163,6 +180,163 @@ def upload_post_username_for_user(user: dict[str, Any]) -> str:
     )
 
 
+def as_positive_int(value: Any, fallback: int = 0) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else fallback
+    except Exception:
+        return fallback
+
+
+def normalize_scheduled_date(value: str | None) -> str | None:
+    trimmed = (value or "").strip()
+    if not trimmed:
+        return None
+
+    normalized = trimmed.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            parsed = datetime.strptime(normalized, fmt)
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return None
+
+
+def to_absolute_media_url(value: str, origin: str) -> str:
+    trimmed = value.strip()
+    if not trimmed:
+        return ""
+    if trimmed.startswith("http://") or trimmed.startswith("https://"):
+        return trimmed
+    if trimmed.startswith("/"):
+        return f"{origin.rstrip('/')}{trimmed}"
+    return trimmed
+
+
+def resolve_blogger_image_for_publish(
+    blogger: dict[str, Any],
+    *,
+    category: Literal["view", "clothes", "home", "cars", "relatives"],
+    image_id: str,
+) -> tuple[str, str] | None:
+    normalized_id = image_id.strip()
+    if not normalized_id:
+        return None
+
+    if category == "view":
+        if normalized_id == "base":
+            image_ref = str(blogger.get("baseImage") or "").strip()
+            return (image_ref, "Базовый образ") if image_ref else None
+
+        for item in blogger.get("looks") or []:
+            record = as_record(item)
+            if str(record.get("id") or "").strip() != normalized_id:
+                continue
+            image_ref = str(record.get("imageRef") or "").strip()
+            image_name = str(record.get("name") or "Образ").strip() or "Образ"
+            return (image_ref, image_name) if image_ref else None
+        return None
+
+    collection = blogger.get(category)
+    if not isinstance(collection, list):
+        return None
+    for item in collection:
+        record = as_record(item)
+        if str(record.get("id") or "").strip() != normalized_id:
+            continue
+        image_ref = str(record.get("imageRef") or "").strip()
+        image_name = str(record.get("name") or "Изображение").strip() or "Изображение"
+        return (image_ref, image_name) if image_ref else None
+    return None
+
+
+def user_token_balance(user: dict[str, Any] | None) -> int:
+    if not isinstance(user, dict):
+        return 0
+    return as_positive_int(user.get("tokenBalance"), fallback=0)
+
+
+def token_settings_payload() -> dict[str, Any]:
+    return {
+        "photoGenerationCost": max(1, TOKEN_COST_PHOTO),
+        "videoGenerationCost": max(1, TOKEN_COST_VIDEO),
+        "stripeTokenPriceCents": max(1, STRIPE_TOKEN_PRICE_CENTS),
+        "stripeTokenPriceUsd": max(1, STRIPE_TOKEN_PRICE_CENTS) / 100,
+    }
+
+
+def default_checkout_success_url(request: Request) -> str:
+    root = FRONTEND_APP_URL or request_origin(request)
+    return (
+        f"{root.rstrip('/')}/cabinet?checkout=success&session_id={{CHECKOUT_SESSION_ID}}"
+    )
+
+
+def default_checkout_cancel_url(request: Request) -> str:
+    root = FRONTEND_APP_URL or request_origin(request)
+    return f"{root.rstrip('/')}/cabinet?checkout=cancel"
+
+
+@dataclass
+class ReservedTokenSpend:
+    user_id: str
+    amount: int
+    reason: str
+    metadata: dict[str, Any]
+
+
+def reserve_tokens_for_generation(
+    *,
+    user_id: str,
+    amount: int,
+    reason: str,
+    metadata: dict[str, Any],
+) -> tuple[ReservedTokenSpend | None, JSONResponse | None]:
+    result = db.spend_user_tokens(
+        user_id=user_id,
+        amount=amount,
+        reason=reason,
+        metadata=metadata,
+    )
+    if not result.get("success"):
+        error = str(result.get("error") or "")
+        if error == "insufficient_tokens":
+            available = int(result.get("balance") or 0)
+            return None, api_error(
+                f"Недостаточно токенов. Нужно {amount}, доступно {available}",
+                status=402,
+                code="INSUFFICIENT_TOKENS",
+                required=amount,
+                available=available,
+            )
+        if error == "user_not_found":
+            return None, unauthorized_response("User not found")
+        return None, api_error("Не удалось списать токены", status=500)
+
+    return (
+        ReservedTokenSpend(
+            user_id=user_id,
+            amount=amount,
+            reason=reason,
+            metadata=metadata,
+        ),
+        None,
+    )
+
+
+def refund_reserved_tokens(reserved: ReservedTokenSpend, *, reason: str) -> None:
+    db.credit_user_tokens(
+        user_id=reserved.user_id,
+        amount=reserved.amount,
+        reason=reason,
+        metadata={
+            **reserved.metadata,
+            "refundForReason": reserved.reason,
+        },
+    )
+
+
 def is_owned_by_user(record: dict[str, Any] | None, user_id: str) -> bool:
     if not isinstance(record, dict):
         return False
@@ -266,10 +440,27 @@ class SocialPublishVideoRequest(BaseModel):
     asyncUpload: bool = True
 
 
+class SocialPublishImageRequest(BaseModel):
+    bloggerId: str = Field(min_length=1)
+    category: Literal["view", "clothes", "home", "cars", "relatives"]
+    imageId: str = Field(min_length=1)
+    platforms: list[PublishSocialPlatform]
+    title: str | None = None
+    description: str | None = None
+    scheduledDate: str | None = None
+    timezone: str | None = None
+    asyncUpload: bool = True
+
+
+class CreateCheckoutSessionRequest(BaseModel):
+    tokenAmount: int = Field(ge=1, le=100000)
+
+
 PUBLIC_AUTH_PATHS = {
     "/api/auth/register",
     "/api/auth/login",
     "/api/auth/google",
+    "/api/webhooks/stripe",
 }
 
 
@@ -325,6 +516,11 @@ async def auth_register(payload: RegisterRequest) -> Any:
             "provider": "local",
         }
     )
+    user_id = str(user.get("id") or "").strip()
+    if user_id:
+        refreshed = db.get_user_by_id(user_id)
+        if refreshed:
+            user = refreshed
     token = issue_token_for_user(user)
     return {
         "token": token,
@@ -345,6 +541,13 @@ async def auth_login(payload: LoginRequest) -> Any:
 
     if not verify_password(payload.password, password_hash):
         return api_error("Invalid email or password", status=401)
+
+    user_id = str(user.get("id") or "").strip()
+    if user_id:
+        db.ensure_user_token_balance(user_id)
+        refreshed = db.get_user_by_id(user_id)
+        if refreshed:
+            user = refreshed
 
     token = issue_token_for_user(user)
     return {
@@ -382,6 +585,13 @@ async def auth_google(payload: GoogleAuthRequest) -> Any:
             }
         )
 
+    user_id = str(user.get("id") or "").strip()
+    if user_id:
+        db.ensure_user_token_balance(user_id)
+        refreshed = db.get_user_by_id(user_id)
+        if refreshed:
+            user = refreshed
+
     token = issue_token_for_user(user)
     return {
         "token": token,
@@ -398,7 +608,157 @@ async def auth_me(request: Request) -> Any:
         user = get_user_by_access_token(token)
     except AuthError as exc:
         return unauthorized_response(str(exc))
+    user_id = str(user.get("id") or "").strip()
+    if user_id:
+        db.ensure_user_token_balance(user_id)
+        refreshed = db.get_user_by_id(user_id)
+        if refreshed:
+            user = refreshed
     return {"user": sanitize_user(user)}
+
+
+@app.get("/api/account/me")
+async def account_me(request: Request) -> Any:
+    user = current_user(request)
+    user_id = str(user.get("id") or "").strip()
+    if not user_id:
+        return unauthorized_response("User not found")
+
+    db.ensure_user_token_balance(user_id)
+    fresh_user = db.get_user_by_id(user_id)
+    if not fresh_user:
+        return unauthorized_response("User not found")
+
+    return {
+        "user": sanitize_user(fresh_user),
+        "tokenBalance": user_token_balance(fresh_user),
+        "tokenSettings": token_settings_payload(),
+        "stripeEnabled": True,
+    }
+
+
+@app.get("/api/account/token-transactions")
+async def account_token_transactions(request: Request, limit: int = Query(default=50)) -> Any:
+    user = current_user(request)
+    user_id = str(user.get("id") or "").strip()
+    if not user_id:
+        return unauthorized_response("User not found")
+
+    items = db.list_token_transactions(user_id=user_id, limit=limit)
+    return {"items": items}
+
+
+@app.post("/api/billing/create-checkout-session")
+async def billing_create_checkout_session(
+    request: Request,
+    payload: CreateCheckoutSessionRequest,
+) -> Any:
+    user = current_user(request)
+    user_id = str(user.get("id") or "").strip()
+    if not user_id:
+        return unauthorized_response("User not found")
+
+    success_url = STRIPE_CHECKOUT_SUCCESS_URL.strip() or default_checkout_success_url(request)
+    cancel_url = STRIPE_CHECKOUT_CANCEL_URL.strip() or default_checkout_cancel_url(request)
+
+    try:
+        session = await create_checkout_session(
+            user_id=user_id,
+            user_email=str(user.get("email") or ""),
+            token_amount=payload.tokenAmount,
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+        db.create_or_update_checkout_session(
+            session_id=str(session.get("id")),
+            user_id=user_id,
+            token_amount=int(session.get("tokenAmount") or payload.tokenAmount),
+            amount_cents=int(session.get("amountCents") or 0),
+            currency=str(session.get("currency") or "usd"),
+            status="pending",
+            metadata={
+                "source": "checkout_session_create",
+            },
+        )
+        return {
+            "sessionId": session.get("id"),
+            "url": session.get("url"),
+            "tokenAmount": session.get("tokenAmount"),
+            "amountCents": session.get("amountCents"),
+            "currency": session.get("currency"),
+        }
+    except StripeBillingError as exc:
+        return api_error(
+            str(exc),
+            status=exc.status_code,
+            upstream=exc.upstream,
+        )
+    except Exception as exc:
+        return api_error(f"Failed to create checkout session: {exc}", status=500)
+
+
+@app.post("/api/webhooks/stripe")
+async def stripe_webhook(request: Request) -> Any:
+    payload = await request.body()
+    signature = request.headers.get("Stripe-Signature")
+    try:
+        event = verify_and_parse_webhook(payload, signature)
+    except StripeBillingError as exc:
+        return api_error(str(exc), status=exc.status_code, upstream=exc.upstream)
+
+    event_type = str(event.get("type") or "")
+    event_id = str(event.get("id") or "")
+    data = as_record(event.get("data"))
+    event_object = as_record(data.get("object"))
+
+    if event_type not in {
+        "checkout.session.completed",
+        "checkout.session.async_payment_succeeded",
+    }:
+        return {"received": True, "ignored": True, "eventType": event_type}
+
+    payment_status = str(event_object.get("payment_status") or "").lower()
+    if payment_status != "paid":
+        return {
+            "received": True,
+            "ignored": True,
+            "eventType": event_type,
+            "reason": "payment_not_paid",
+        }
+
+    session_id = str(event_object.get("id") or "").strip()
+    metadata = as_record(event_object.get("metadata"))
+    user_id = str(
+        metadata.get("user_id")
+        or event_object.get("client_reference_id")
+        or ""
+    ).strip()
+    token_amount = as_positive_int(metadata.get("token_amount"), fallback=0)
+    amount_cents = as_positive_int(event_object.get("amount_total"), fallback=0)
+    currency = str(event_object.get("currency") or "usd").lower()
+    payment_intent = str(event_object.get("payment_intent") or "").strip()
+
+    if not session_id or not user_id or token_amount <= 0:
+        return api_error(
+            "Stripe webhook payload is missing required checkout metadata",
+            status=400,
+            eventType=event_type,
+            sessionId=session_id,
+        )
+
+    applied = db.apply_paid_checkout(
+        session_id=session_id,
+        user_id=user_id,
+        token_amount=token_amount,
+        amount_cents=amount_cents,
+        currency=currency,
+        payment_intent=payment_intent or None,
+        event_id=event_id or None,
+        metadata={
+            "eventType": event_type,
+        },
+    )
+    return {"received": True, **applied}
 
 
 @app.get("/api/social/accounts")
@@ -513,6 +873,14 @@ async def social_publish_video(payload: SocialPublishVideoRequest, request: Requ
     if not output_url:
         return api_error("Видео еще не готово для публикации", status=400)
 
+    normalized_scheduled_date = normalize_scheduled_date(payload.scheduledDate)
+    if (payload.scheduledDate or "").strip() and not normalized_scheduled_date:
+        return api_error(
+            "Некорректная дата публикации. Используй формат YYYY-MM-DDTHH:MM",
+            status=400,
+        )
+    normalized_timezone = (payload.timezone or "").strip() or None
+
     try:
         trimmed_title = (payload.title or "").strip()
         default_title = (str(video.get("prompt") or "").strip() or "Generated video")[:220]
@@ -522,18 +890,21 @@ async def social_publish_video(payload: SocialPublishVideoRequest, request: Requ
             platforms=payload.platforms,
             title=trimmed_title or default_title,
             description=(payload.description or "").strip() or None,
-            scheduled_date=(payload.scheduledDate or "").strip() or None,
-            timezone=(payload.timezone or "").strip() or None,
+            scheduled_date=normalized_scheduled_date,
+            timezone=normalized_timezone,
             async_upload=payload.asyncUpload,
         )
 
         request_id = str(publish_result.get("request_id") or "").strip()
         job_id = str(publish_result.get("job_id") or "").strip()
-        publish_status = "completed"
-        if request_id:
-            publish_status = "processing"
-        elif job_id:
+        if normalized_scheduled_date:
             publish_status = "scheduled"
+        else:
+            publish_status = "completed"
+            if request_id:
+                publish_status = "processing"
+            elif job_id:
+                publish_status = "scheduled"
 
         db.update_video(
             payload.videoId,
@@ -545,6 +916,8 @@ async def social_publish_video(payload: SocialPublishVideoRequest, request: Requ
                     "requestId": request_id or None,
                     "jobId": job_id or None,
                     "status": publish_status,
+                    "scheduledDate": normalized_scheduled_date,
+                    "timezone": normalized_timezone,
                     "response": publish_result,
                     "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 }
@@ -557,6 +930,8 @@ async def social_publish_video(payload: SocialPublishVideoRequest, request: Requ
             "requestId": request_id or None,
             "jobId": job_id or None,
             "status": publish_status,
+            "scheduledDate": normalized_scheduled_date,
+            "timezone": normalized_timezone,
             "uploadPost": publish_result,
         }
     except UploadPostError as exc:
@@ -567,6 +942,83 @@ async def social_publish_video(payload: SocialPublishVideoRequest, request: Requ
         )
     except Exception as exc:
         return api_error(f"Failed to publish video: {exc}", status=500)
+
+
+@app.post("/api/social/publish-image")
+async def social_publish_image(payload: SocialPublishImageRequest, request: Request) -> Any:
+    if len(payload.platforms) == 0:
+        return api_error("Нужно выбрать хотя бы одну платформу", status=400)
+
+    user = current_user(request)
+    user_id = str(user.get("id") or "").strip()
+    username = upload_post_username_for_user(user)
+
+    blogger = db.get_blogger_by_id(payload.bloggerId)
+    if not blogger or not is_owned_by_user(blogger, user_id):
+        return api_error("Blogger not found", status=404)
+
+    image_result = resolve_blogger_image_for_publish(
+        blogger,
+        category=payload.category,
+        image_id=payload.imageId,
+    )
+    if not image_result:
+        return api_error("Изображение не найдено", status=404)
+    image_ref, image_name = image_result
+    image_url = to_absolute_media_url(image_ref, request_origin(request))
+    if not image_url:
+        return api_error("Изображение недоступно для публикации", status=400)
+
+    normalized_scheduled_date = normalize_scheduled_date(payload.scheduledDate)
+    if (payload.scheduledDate or "").strip() and not normalized_scheduled_date:
+        return api_error(
+            "Некорректная дата публикации. Используй формат YYYY-MM-DDTHH:MM",
+            status=400,
+        )
+    normalized_timezone = (payload.timezone or "").strip() or None
+
+    try:
+        publish_result = await publish_photo_urls(
+            username=username,
+            photo_urls=[image_url],
+            platforms=payload.platforms,
+            title=(payload.title or "").strip() or image_name,
+            description=(payload.description or "").strip() or None,
+            scheduled_date=normalized_scheduled_date,
+            timezone=normalized_timezone,
+            async_upload=payload.asyncUpload,
+        )
+
+        request_id = str(publish_result.get("request_id") or "").strip()
+        job_id = str(publish_result.get("job_id") or "").strip()
+        if normalized_scheduled_date:
+            publish_status = "scheduled"
+        else:
+            publish_status = "completed"
+            if request_id:
+                publish_status = "processing"
+            elif job_id:
+                publish_status = "scheduled"
+
+        return {
+            "success": True,
+            "bloggerId": payload.bloggerId,
+            "imageId": payload.imageId,
+            "requestId": request_id or None,
+            "jobId": job_id or None,
+            "status": publish_status,
+            "scheduledDate": normalized_scheduled_date,
+            "timezone": normalized_timezone,
+            "uploadPost": publish_result,
+        }
+    except UploadPostError as exc:
+        return api_error(
+            str(exc),
+            status=exc.status_code,
+            upstream=exc.upstream,
+        )
+    except Exception as exc:
+        return api_error(f"Failed to publish image: {exc}", status=500)
 
 
 @app.get("/api/social/publish-status")
@@ -668,6 +1120,18 @@ async def create_blogger_in_nano(
     if not blogger or not is_owned_by_user(blogger, user_id):
         return api_error("Blogger not found", status=404)
 
+    reserved, reserve_error = reserve_tokens_for_generation(
+        user_id=user_id,
+        amount=max(1, TOKEN_COST_PHOTO),
+        reason="photo_generation",
+        metadata={
+            "operation": "create_in_nano",
+            "bloggerId": blogger_id,
+        },
+    )
+    if reserve_error:
+        return reserve_error
+
     try:
         reference_image = payload.referenceImage if payload else None
 
@@ -687,6 +1151,8 @@ async def create_blogger_in_nano(
         )
 
         if not result.get("success"):
+            if reserved:
+                refund_reserved_tokens(reserved, reason="refund_generation_failed")
             return api_error(
                 result.get("error") or "Failed to create character in Nano Banano",
                 status=500,
@@ -706,10 +1172,13 @@ async def create_blogger_in_nano(
             "success": True,
             "nanoBananoId": result.get("id"),
             "baseImage": base_image,
+            "tokenBalance": db.ensure_user_token_balance(user_id),
             },
             request_origin(request),
         )
     except Exception as exc:
+        if reserved:
+            refund_reserved_tokens(reserved, reason="refund_generation_failed")
         return api_error(f"Failed to create in Nano Banano: {exc}", status=500)
 
 
@@ -751,6 +1220,18 @@ async def create_look(blogger_id: str, payload: CreateLookRequest, request: Requ
             if reference != primary_reference_image:
                 reference_images.append(reference)
 
+        reserved, reserve_error = reserve_tokens_for_generation(
+            user_id=user_id,
+            amount=max(1, TOKEN_COST_PHOTO),
+            reason="photo_generation",
+            metadata={
+                "operation": "create_look",
+                "bloggerId": blogger_id,
+            },
+        )
+        if reserve_error:
+            return reserve_error
+
         generated = await create_character_with_reference(
             {
                 "prompt": payload.prompt,
@@ -763,6 +1244,8 @@ async def create_look(blogger_id: str, payload: CreateLookRequest, request: Requ
         )
 
         if not generated.get("success") or not generated.get("imageUrl"):
+            if reserved:
+                refund_reserved_tokens(reserved, reason="refund_generation_failed")
             return api_error(
                 generated.get("error") or "Failed to generate look image",
                 status=500,
@@ -778,8 +1261,16 @@ async def create_look(blogger_id: str, payload: CreateLookRequest, request: Requ
         ]
 
         updated = db.update_blogger(blogger_id, {"looks": next_looks})
-        return with_public_upload_urls(updated, request_origin(request))
+        response_payload = with_public_upload_urls(updated, request_origin(request))
+        if isinstance(response_payload, dict):
+            response_payload["tokenBalance"] = db.ensure_user_token_balance(user_id)
+        return response_payload
     except Exception as exc:
+        try:
+            if "reserved" in locals() and reserved:
+                refund_reserved_tokens(reserved, reason="refund_generation_failed")
+        except Exception:
+            pass
         return api_error(f"Failed to create look: {exc}", status=500)
 
 
@@ -795,6 +1286,21 @@ async def create_asset(blogger_id: str, payload: CreateAssetRequest, request: Re
     if payload.action == "generate" and not payload.prompt:
         return api_error("Для генерации нужен промпт", status=400)
 
+    reserved: ReservedTokenSpend | None = None
+    if payload.action == "generate":
+        reserved, reserve_error = reserve_tokens_for_generation(
+            user_id=user_id,
+            amount=max(1, TOKEN_COST_PHOTO),
+            reason="photo_generation",
+            metadata={
+                "operation": "create_asset_generate",
+                "bloggerId": blogger_id,
+                "category": payload.category,
+            },
+        )
+        if reserve_error:
+            return reserve_error
+
     try:
         image_ref = (
             str(payload.imageUrl)
@@ -802,6 +1308,8 @@ async def create_asset(blogger_id: str, payload: CreateAssetRequest, request: Re
             else (await create_character(str(payload.prompt or ""))).get("imageUrl")
         )
         if not image_ref:
+            if reserved:
+                refund_reserved_tokens(reserved, reason="refund_generation_failed")
             return api_error("Не удалось получить изображение", status=500)
 
         collection = blogger.get(payload.category)
@@ -817,8 +1325,13 @@ async def create_asset(blogger_id: str, payload: CreateAssetRequest, request: Re
         ]
 
         updated = db.update_blogger(blogger_id, {payload.category: next_collection})
-        return with_public_upload_urls(updated, request_origin(request))
+        response_payload = with_public_upload_urls(updated, request_origin(request))
+        if isinstance(response_payload, dict):
+            response_payload["tokenBalance"] = db.ensure_user_token_balance(user_id)
+        return response_payload
     except Exception as exc:
+        if reserved:
+            refund_reserved_tokens(reserved, reason="refund_generation_failed")
         return api_error(f"Failed to create item: {exc}", status=500)
 
 
@@ -870,6 +1383,19 @@ async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
             if not resolved_image_urls or len(resolved_image_urls) == 0:
                 return api_error("Для Motion Control нужно передать входящее изображение", status=400)
 
+        reserved, reserve_error = reserve_tokens_for_generation(
+            user_id=user_id,
+            amount=max(1, TOKEN_COST_VIDEO),
+            reason="video_generation",
+            metadata={
+                "operation": "create_video",
+                "bloggerId": payload.bloggerId,
+                "videoType": payload.type,
+            },
+        )
+        if reserve_error:
+            return reserve_error
+
         nb_result = await generate_video(
             {
                 "bloggerId": payload.bloggerId,
@@ -897,9 +1423,25 @@ async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
                 "outputUrl": nb_result.get("outputUrl"),
             }
         )
+        if not str(nb_result.get("id") or "").strip() and str(nb_result.get("status") or "").lower() == "failed":
+            if reserved:
+                refund_reserved_tokens(reserved, reason="refund_generation_failed")
+            return api_error(
+                str(nb_result.get("error") or "Не удалось создать видео"),
+                status=500,
+            )
 
-        return with_public_upload_urls(video, request_origin(request))
+        response_payload = with_public_upload_urls(video, request_origin(request))
+        if isinstance(response_payload, dict):
+            response_payload["tokenBalance"] = db.ensure_user_token_balance(user_id)
+        return response_payload
     except Exception as exc:
+        # Any hard failure before job submission should return tokens.
+        try:
+            if "reserved" in locals() and reserved:
+                refund_reserved_tokens(reserved, reason="refund_generation_failed")
+        except Exception:
+            pass
         return api_error(str(exc), status=500)
 
 

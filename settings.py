@@ -15,6 +15,16 @@ DATA_DIR = BACKEND_DIR / "data"
 LEGACY_DATA_DIR = ROOT_DIR / "data"
 PUBLIC_DIR = BACKEND_DIR / "public"
 
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except Exception:
+        return default
+
 UPLOAD_API_BASE_URL = os.getenv("UPLOAD_API_BASE_URL", "https://stage.neuro-x.online/api").rstrip("/")
 UPLOAD_POST_API_BASE_URL = os.getenv(
     "UPLOAD_POST_API_BASE_URL",
@@ -43,6 +53,10 @@ FRONTEND_ORIGINS = [
     ).split(",")
     if item.strip()
 ]
+FRONTEND_APP_URL = (
+    os.getenv("FRONTEND_APP_URL", "").strip().rstrip("/")
+    or (FRONTEND_ORIGINS[0].rstrip("/") if FRONTEND_ORIGINS else "http://localhost:5173")
+)
 
 POLL_INTERVAL_SECONDS = 3
 POLL_MAX_ATTEMPTS = 100
@@ -52,3 +66,14 @@ NETWORK_RETRY_DELAY_SECONDS = 1
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-change-me")
 JWT_EXPIRES_HOURS = int(os.getenv("JWT_EXPIRES_HOURS", "24"))
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+
+TOKEN_INITIAL_BALANCE = _int_env("TOKEN_INITIAL_BALANCE", 0)
+TOKEN_COST_PHOTO = _int_env("TOKEN_COST_PHOTO", 2)
+TOKEN_COST_VIDEO = _int_env("TOKEN_COST_VIDEO", 10)
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+STRIPE_TOKEN_PRICE_CENTS = _int_env("STRIPE_TOKEN_PRICE_CENTS", 10)
+STRIPE_CHECKOUT_SUCCESS_URL = os.getenv("STRIPE_CHECKOUT_SUCCESS_URL", "").strip()
+STRIPE_CHECKOUT_CANCEL_URL = os.getenv("STRIPE_CHECKOUT_CANCEL_URL", "").strip()
+STRIPE_WEBHOOK_TOLERANCE_SECONDS = _int_env("STRIPE_WEBHOOK_TOLERANCE_SECONDS", 300)

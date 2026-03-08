@@ -90,6 +90,7 @@ def sanitize_user(user: dict[str, Any]) -> dict[str, Any]:
         "email": user.get("email"),
         "name": user.get("name"),
         "provider": user.get("provider"),
+        "tokenBalance": user.get("tokenBalance"),
         "createdAt": user.get("createdAt"),
     }
 

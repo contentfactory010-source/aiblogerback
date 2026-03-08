@@ -351,6 +351,73 @@ async def publish_video_url(
     return record
 
 
+async def publish_photo_urls(
+    *,
+    username: str,
+    photo_urls: Iterable[str],
+    platforms: Iterable[str],
+    title: str | None = None,
+    description: str | None = None,
+    scheduled_date: str | None = None,
+    timezone: str | None = None,
+    async_upload: bool = True,
+) -> dict[str, Any]:
+    normalized_user = username.strip()
+    if not normalized_user:
+        raise UploadPostError("Upload-Post username is required", status_code=400)
+
+    normalized_photos: list[str] = []
+    for value in photo_urls:
+        url = str(value).strip()
+        if not url:
+            continue
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise UploadPostError("Photo URL must be absolute http(s) URL", status_code=400)
+        normalized_photos.append(url)
+    if len(normalized_photos) == 0:
+        raise UploadPostError("At least one photo URL is required", status_code=400)
+
+    normalized_platforms = _normalize_platforms(
+        platforms,
+        allowed=PUBLISH_PLATFORMS,
+    )
+    if len(normalized_platforms) == 0:
+        raise UploadPostError(
+            "At least one platform is required",
+            status_code=400,
+        )
+
+    await ensure_user_profile(normalized_user)
+
+    multipart_fields: list[tuple[str, tuple[None, str]]] = [
+        ("user", (None, normalized_user)),
+        ("async_upload", (None, "true" if async_upload else "false")),
+    ]
+    for platform in normalized_platforms:
+        multipart_fields.append(("platform[]", (None, platform)))
+    for photo in normalized_photos:
+        multipart_fields.append(("photos[]", (None, photo)))
+    if title and title.strip():
+        multipart_fields.append(("title", (None, title.strip())))
+    if description and description.strip():
+        multipart_fields.append(("description", (None, description.strip())))
+    if scheduled_date and scheduled_date.strip():
+        multipart_fields.append(("scheduled_date", (None, scheduled_date.strip())))
+    if timezone and timezone.strip():
+        multipart_fields.append(("timezone", (None, timezone.strip())))
+
+    payload = await _request("POST", "/upload_photos", files=multipart_fields)
+    record = _as_record(payload)
+    if record.get("success") is False:
+        message = _extract_error_message(payload) or "Upload-Post rejected publication"
+        raise UploadPostError(
+            message,
+            status_code=502,
+            upstream=payload,
+        )
+    return record
+
+
 async def get_publish_status(
     *,
     request_id: str | None = None,
