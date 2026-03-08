@@ -297,6 +297,22 @@ def checkout_frontend_root(request: Request) -> str:
     return normalize_http_origin(FRONTEND_APP_URL) or request_origin(request)
 
 
+def is_allowed_checkout_redirect(url: str, request: Request) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    redirect_origin = f"{parsed.scheme}://{parsed.netloc}"
+    allowed_origins = {
+        normalize_http_origin(item)
+        for item in [*FRONTEND_ORIGINS, FRONTEND_APP_URL, request_origin(request)]
+        if normalize_http_origin(item)
+    }
+    return redirect_origin in allowed_origins
+
+
 def default_checkout_success_url(request: Request) -> str:
     root = checkout_frontend_root(request)
     return (
@@ -485,6 +501,8 @@ class SocialPublishImageRequest(BaseModel):
 
 class CreateCheckoutSessionRequest(BaseModel):
     tokenAmount: int = Field(ge=1, le=100000)
+    successUrl: str | None = None
+    cancelUrl: str | None = None
 
 
 PUBLIC_AUTH_PATHS = {
@@ -689,8 +707,23 @@ async def billing_create_checkout_session(
     if not user_id:
         return unauthorized_response("User not found")
 
-    success_url = STRIPE_CHECKOUT_SUCCESS_URL.strip() or default_checkout_success_url(request)
-    cancel_url = STRIPE_CHECKOUT_CANCEL_URL.strip() or default_checkout_cancel_url(request)
+    requested_success_url = (payload.successUrl or "").strip()
+    requested_cancel_url = (payload.cancelUrl or "").strip()
+    if requested_success_url and not is_allowed_checkout_redirect(requested_success_url, request):
+        return api_error("Invalid successUrl origin", status=400)
+    if requested_cancel_url and not is_allowed_checkout_redirect(requested_cancel_url, request):
+        return api_error("Invalid cancelUrl origin", status=400)
+
+    success_url = (
+        requested_success_url
+        or STRIPE_CHECKOUT_SUCCESS_URL.strip()
+        or default_checkout_success_url(request)
+    )
+    cancel_url = (
+        requested_cancel_url
+        or STRIPE_CHECKOUT_CANCEL_URL.strip()
+        or default_checkout_cancel_url(request)
+    )
 
     try:
         session = await create_checkout_session(
