@@ -1329,19 +1329,19 @@ async def create_look(blogger_id: str, payload: CreateLookRequest, request: Requ
             blogger.get("looks", [{}])[0].get("imageRef") if blogger.get("looks") else None
         )
 
-        if not primary_reference_image:
-            return api_error(
-                "Нужен минимум один существующий образ блоггера для image_input",
-                status=400,
-            )
-
         if mode == "clone" and len(uploaded_reference_images) == 0:
             return api_error("Для клонирования нужен второй референс", status=400)
 
-        reference_images = [primary_reference_image]
-        for reference in uploaded_reference_images:
-            if reference != primary_reference_image:
-                reference_images.append(reference)
+        if len(uploaded_reference_images) > 0:
+            # If explicit references were provided from client, use only them.
+            reference_images = list(dict.fromkeys(uploaded_reference_images))
+        else:
+            if not primary_reference_image:
+                return api_error(
+                    "Нужен минимум один существующий образ блоггера для image_input",
+                    status=400,
+                )
+            reference_images = [primary_reference_image]
 
         reserved, reserve_error = reserve_tokens_for_generation(
             user_id=user_id,
