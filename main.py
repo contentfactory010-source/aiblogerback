@@ -37,7 +37,8 @@ from .settings import (
     PUBLIC_DIR,
     STRIPE_CHECKOUT_CANCEL_URL,
     STRIPE_CHECKOUT_SUCCESS_URL,
-    STRIPE_TOKEN_PRICE_CENTS,
+    STRIPE_PACKAGE_PRICE_CENTS,
+    STRIPE_TOKEN_PRICE_USD,
     TOKEN_COST_PHOTO,
     TOKEN_COST_VIDEO,
     UPLOAD_API_BASE_URL,
@@ -261,11 +262,12 @@ def user_token_balance(user: dict[str, Any] | None) -> int:
 
 
 def token_settings_payload() -> dict[str, Any]:
+    normalized_usd_price = max(0.001, float(STRIPE_TOKEN_PRICE_USD))
     return {
         "photoGenerationCost": max(1, TOKEN_COST_PHOTO),
         "videoGenerationCost": max(1, TOKEN_COST_VIDEO),
-        "stripeTokenPriceCents": max(1, STRIPE_TOKEN_PRICE_CENTS),
-        "stripeTokenPriceUsd": max(1, STRIPE_TOKEN_PRICE_CENTS) / 100,
+        "stripeTokenPriceCents": normalized_usd_price * 100,
+        "stripeTokenPriceUsd": normalized_usd_price,
     }
 
 
@@ -324,6 +326,21 @@ def default_checkout_success_url(request: Request) -> str:
 def default_checkout_cancel_url(request: Request) -> str:
     root = checkout_frontend_root(request)
     return f"{root.rstrip('/')}/billing?checkout=cancel"
+
+
+def checkout_referer_path(request: Request) -> str:
+    referer = (request.headers.get("referer") or "").strip()
+    if not referer:
+        return ""
+    try:
+        parsed = urlparse(referer)
+    except Exception:
+        return ""
+    return parsed.path.rstrip("/")
+
+
+def is_package_checkout_flow(request: Request) -> bool:
+    return checkout_referer_path(request) in {"/onboarding/step-4", "/payment"}
 
 
 def inferred_onboarding_checkout_success_url(request: Request) -> str:
@@ -547,6 +564,7 @@ class SocialPublishImageRequest(BaseModel):
 
 class CreateCheckoutSessionRequest(BaseModel):
     tokenAmount: int = Field(ge=1, le=100000)
+    amountCents: int | None = Field(default=None, ge=1, le=100000000)
     successUrl: str | None = None
     cancelUrl: str | None = None
 
@@ -755,6 +773,7 @@ async def billing_create_checkout_session(
 
     requested_success_url = (payload.successUrl or "").strip()
     requested_cancel_url = (payload.cancelUrl or "").strip()
+    requested_amount_cents = int(payload.amountCents) if payload.amountCents is not None else None
     if requested_success_url and not is_allowed_checkout_redirect(requested_success_url, request):
         return api_error("Invalid successUrl origin", status=400)
     if requested_cancel_url and not is_allowed_checkout_redirect(requested_cancel_url, request):
@@ -776,6 +795,18 @@ async def billing_create_checkout_session(
         or default_checkout_cancel_url(request)
     )
 
+    package_price_cents = STRIPE_PACKAGE_PRICE_CENTS.get(int(payload.tokenAmount))
+    amount_cents_override: int | None = None
+    if requested_amount_cents is not None:
+        if package_price_cents is None or requested_amount_cents != package_price_cents:
+            return api_error("Invalid package pricing", status=400)
+        amount_cents_override = requested_amount_cents
+    elif package_price_cents is not None and is_package_checkout_flow(request):
+        amount_cents_override = package_price_cents
+    else:
+        calculated_amount_cents = int(round(float(payload.tokenAmount) * float(STRIPE_TOKEN_PRICE_USD) * 100))
+        amount_cents_override = max(1, calculated_amount_cents)
+
     try:
         session = await create_checkout_session(
             user_id=user_id,
@@ -783,6 +814,7 @@ async def billing_create_checkout_session(
             token_amount=payload.tokenAmount,
             success_url=success_url,
             cancel_url=cancel_url,
+            amount_cents_override=amount_cents_override,
         )
         db.create_or_update_checkout_session(
             session_id=str(session.get("id")),
