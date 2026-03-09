@@ -17,6 +17,7 @@ from .settings import (
 
 STRIPE_API_BASE_URL = "https://api.stripe.com/v1"
 STRIPE_PAYMENT_METADATA_SOURCE = "neuro-c_ai_influencer"
+STRIPE_PAYMENT_METADATA_FLAG_KEY = "neuro-c_ai_influencer"
 
 
 class StripeBillingError(RuntimeError):
@@ -164,6 +165,10 @@ async def create_checkout_session(
 
     unit_amount = max(1, STRIPE_TOKEN_PRICE_CENTS)
     amount_cents = unit_amount * normalized_tokens
+    payment_metadata = {
+        "source": STRIPE_PAYMENT_METADATA_SOURCE,
+        STRIPE_PAYMENT_METADATA_FLAG_KEY: "1",
+    }
 
     form_data: dict[str, str] = {
         "mode": "payment",
@@ -173,13 +178,14 @@ async def create_checkout_session(
         "metadata[user_id]": user_id,
         "metadata[token_amount]": str(normalized_tokens),
         "metadata[checkout_type]": "token_topup",
-        "metadata[source]": STRIPE_PAYMENT_METADATA_SOURCE,
-        "payment_intent_data[metadata][source]": STRIPE_PAYMENT_METADATA_SOURCE,
         "line_items[0][price_data][currency]": "usd",
         "line_items[0][price_data][unit_amount]": str(unit_amount),
         "line_items[0][price_data][product_data][name]": "AI Tokens",
         "line_items[0][quantity]": str(normalized_tokens),
     }
+    for key, value in payment_metadata.items():
+        form_data[f"metadata[{key}]"] = value
+        form_data[f"payment_intent_data[metadata][{key}]"] = value
     if user_email:
         form_data["customer_email"] = user_email.strip()
 
@@ -199,4 +205,55 @@ async def create_checkout_session(
         "amountCents": amount_cents,
         "currency": "usd",
         "raw": payload,
+    }
+
+
+async def upsert_payment_intent_metadata(payment_intent_id: str) -> dict[str, Any]:
+    normalized_id = (payment_intent_id or "").strip()
+    if not normalized_id:
+        raise StripeBillingError("payment_intent_id is required", status_code=400)
+
+    metadata = {
+        "source": STRIPE_PAYMENT_METADATA_SOURCE,
+        STRIPE_PAYMENT_METADATA_FLAG_KEY: "1",
+    }
+    form_data = {
+        f"metadata[{key}]": value for key, value in metadata.items()
+    }
+    payload = await _stripe_request(
+        "POST",
+        f"/payment_intents/{normalized_id}",
+        form_data=form_data,
+    )
+    return payload
+
+
+async def upsert_charge_metadata(charge_id: str) -> dict[str, Any]:
+    normalized_id = (charge_id or "").strip()
+    if not normalized_id:
+        raise StripeBillingError("charge_id is required", status_code=400)
+
+    metadata = {
+        "source": STRIPE_PAYMENT_METADATA_SOURCE,
+        STRIPE_PAYMENT_METADATA_FLAG_KEY: "1",
+    }
+    form_data = {
+        f"metadata[{key}]": value for key, value in metadata.items()
+    }
+    payload = await _stripe_request(
+        "POST",
+        f"/charges/{normalized_id}",
+        form_data=form_data,
+    )
+    return payload
+
+
+async def upsert_payment_entities_metadata(payment_intent_id: str) -> dict[str, Any]:
+    payment_intent = await upsert_payment_intent_metadata(payment_intent_id)
+    latest_charge = str(payment_intent.get("latest_charge") or "").strip()
+    if latest_charge:
+        await upsert_charge_metadata(latest_charge)
+    return {
+        "paymentIntentId": str(payment_intent.get("id") or "").strip(),
+        "chargeId": latest_charge or None,
     }

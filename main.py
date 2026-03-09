@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import httpx
 from fastapi import FastAPI, File, Query, Request, UploadFile
@@ -45,6 +45,7 @@ from .settings import (
 from .stripe_billing import (
     StripeBillingError,
     create_checkout_session,
+    upsert_payment_entities_metadata,
     verify_and_parse_webhook,
 )
 from .upload_post import (
@@ -323,6 +324,51 @@ def default_checkout_success_url(request: Request) -> str:
 def default_checkout_cancel_url(request: Request) -> str:
     root = checkout_frontend_root(request)
     return f"{root.rstrip('/')}/billing?checkout=cancel"
+
+
+def inferred_onboarding_checkout_success_url(request: Request) -> str:
+    referer = (request.headers.get("referer") or "").strip()
+    if not referer:
+        return ""
+    try:
+        parsed = urlparse(referer)
+    except Exception:
+        return ""
+
+    if parsed.path.rstrip("/") != "/payment":
+        return ""
+
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    blogger_id = (query.get("bloggerId") or [""])[0].strip()
+    if not blogger_id:
+        return ""
+
+    root = checkout_frontend_root(request)
+    return f"{root.rstrip('/')}/blogger/{quote(blogger_id, safe='')}?tab=looks"
+
+
+def inferred_payment_checkout_cancel_url(request: Request) -> str:
+    referer = (request.headers.get("referer") or "").strip()
+    if not referer:
+        return ""
+    try:
+        parsed = urlparse(referer)
+    except Exception:
+        return ""
+
+    if parsed.path.rstrip("/") != "/payment":
+        return ""
+
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    query.pop("session_id", None)
+    query["checkout"] = ["cancel"]
+    encoded_query = urlencode(query, doseq=True)
+    root = checkout_frontend_root(request)
+    return (
+        f"{root.rstrip('/')}/payment?{encoded_query}"
+        if encoded_query
+        else f"{root.rstrip('/')}/payment?checkout=cancel"
+    )
 
 
 @dataclass
@@ -714,13 +760,18 @@ async def billing_create_checkout_session(
     if requested_cancel_url and not is_allowed_checkout_redirect(requested_cancel_url, request):
         return api_error("Invalid cancelUrl origin", status=400)
 
+    inferred_success_url = inferred_onboarding_checkout_success_url(request)
+    inferred_cancel_url = inferred_payment_checkout_cancel_url(request)
+
     success_url = (
         requested_success_url
+        or inferred_success_url
         or STRIPE_CHECKOUT_SUCCESS_URL.strip()
         or default_checkout_success_url(request)
     )
     cancel_url = (
         requested_cancel_url
+        or inferred_cancel_url
         or STRIPE_CHECKOUT_CANCEL_URL.strip()
         or default_checkout_cancel_url(request)
     )
@@ -822,6 +873,14 @@ async def stripe_webhook(request: Request) -> Any:
             "eventType": event_type,
         },
     )
+
+    if payment_intent:
+        try:
+            await upsert_payment_entities_metadata(payment_intent)
+        except Exception:
+            # Metadata sync failure should not block successful token crediting.
+            pass
+
     return {"received": True, **applied}
 
 
