@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -487,6 +488,7 @@ class CreateVideoRequest(BaseModel):
     referenceImage: str | None = None
     imageUrls: list[str] | None = None
     videoUrls: list[str] | None = None
+    motionDurationSeconds: float | None = None
     motionOrientation: Literal["video", "image"] | None = None
     motionMode: Literal["720p", "1080p"] | None = None
     aspectRatio: Literal["16:9", "9:16", "Auto"] | None = None
@@ -1537,15 +1539,27 @@ async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
                 return api_error("Для Motion Control нужно передать входящее видео", status=400)
             if not resolved_image_urls or len(resolved_image_urls) == 0:
                 return api_error("Для Motion Control нужно передать входящее изображение", status=400)
+            motion_duration_seconds = float(payload.motionDurationSeconds or 0)
+            if not math.isfinite(motion_duration_seconds) or motion_duration_seconds <= 0:
+                return api_error(
+                    "Для Motion Control нужно передать корректную длительность видео в секундах",
+                    status=400,
+                )
+            video_token_cost = max(1, int(math.ceil(motion_duration_seconds)))
+        else:
+            motion_duration_seconds = None
+            video_token_cost = max(1, TOKEN_COST_VIDEO)
 
         reserved, reserve_error = reserve_tokens_for_generation(
             user_id=user_id,
-            amount=max(1, TOKEN_COST_VIDEO),
+            amount=video_token_cost,
             reason="video_generation",
             metadata={
                 "operation": "create_video",
                 "bloggerId": payload.bloggerId,
                 "videoType": payload.type,
+                "motionDurationSeconds": motion_duration_seconds,
+                "chargedTokens": video_token_cost,
             },
         )
         if reserve_error:
