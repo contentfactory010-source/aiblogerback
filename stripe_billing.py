@@ -158,13 +158,23 @@ async def create_checkout_session(
     token_amount: int,
     success_url: str,
     cancel_url: str,
+    amount_cents_override: int | None = None,
 ) -> dict[str, Any]:
     normalized_tokens = int(token_amount)
     if normalized_tokens <= 0:
         raise StripeBillingError("tokenAmount must be greater than 0", status_code=400)
 
-    unit_amount = max(1, STRIPE_TOKEN_PRICE_CENTS)
-    amount_cents = unit_amount * normalized_tokens
+    if amount_cents_override is not None:
+        amount_cents = max(1, int(amount_cents_override))
+        line_item_unit_amount = amount_cents
+        line_item_quantity = 1
+        line_item_name = f"AI Tokens ({normalized_tokens})"
+    else:
+        unit_amount = max(1, STRIPE_TOKEN_PRICE_CENTS)
+        amount_cents = unit_amount * normalized_tokens
+        line_item_unit_amount = unit_amount
+        line_item_quantity = normalized_tokens
+        line_item_name = "AI Tokens"
     payment_metadata = {
         "source": STRIPE_PAYMENT_METADATA_SOURCE,
         STRIPE_PAYMENT_METADATA_FLAG_KEY: "1",
@@ -179,9 +189,9 @@ async def create_checkout_session(
         "metadata[token_amount]": str(normalized_tokens),
         "metadata[checkout_type]": "token_topup",
         "line_items[0][price_data][currency]": "usd",
-        "line_items[0][price_data][unit_amount]": str(unit_amount),
-        "line_items[0][price_data][product_data][name]": "AI Tokens",
-        "line_items[0][quantity]": str(normalized_tokens),
+        "line_items[0][price_data][unit_amount]": str(line_item_unit_amount),
+        "line_items[0][price_data][product_data][name]": line_item_name,
+        "line_items[0][quantity]": str(line_item_quantity),
     }
     for key, value in payment_metadata.items():
         form_data[f"metadata[{key}]"] = value
