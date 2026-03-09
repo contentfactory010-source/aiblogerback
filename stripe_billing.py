@@ -16,6 +16,7 @@ from .settings import (
 )
 
 STRIPE_API_BASE_URL = "https://api.stripe.com/v1"
+STRIPE_PAYMENT_METADATA_SOURCE = "neuro-c_ai_influencer"
 
 
 class StripeBillingError(RuntimeError):
@@ -172,6 +173,8 @@ async def create_checkout_session(
         "metadata[user_id]": user_id,
         "metadata[token_amount]": str(normalized_tokens),
         "metadata[checkout_type]": "token_topup",
+        "metadata[source]": STRIPE_PAYMENT_METADATA_SOURCE,
+        "payment_intent_data[metadata][source]": STRIPE_PAYMENT_METADATA_SOURCE,
         "line_items[0][price_data][currency]": "usd",
         "line_items[0][price_data][unit_amount]": str(unit_amount),
         "line_items[0][price_data][product_data][name]": "AI Tokens",
