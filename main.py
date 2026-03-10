@@ -470,6 +470,7 @@ class CreateLookRequest(BaseModel):
     prompt: str = Field(min_length=1)
     referenceImage: str | None = None
     referenceImages: list[str] | None = None
+    includePrimaryReferenceImage: bool = False
 
 
 class CreateAssetRequest(BaseModel):
@@ -1367,8 +1368,15 @@ async def create_look(blogger_id: str, payload: CreateLookRequest, request: Requ
             return api_error("Для клонирования нужен второй референс", status=400)
 
         if len(uploaded_reference_images) > 0:
-            # If explicit references were provided from client, use only them.
             reference_images = list(dict.fromkeys(uploaded_reference_images))
+            if (
+                payload.includePrimaryReferenceImage
+                and isinstance(primary_reference_image, str)
+                and primary_reference_image.strip()
+            ):
+                reference_images = list(
+                    dict.fromkeys([*reference_images, primary_reference_image.strip()])
+                )
         else:
             if not primary_reference_image:
                 return api_error(
