@@ -1375,7 +1375,7 @@ async def create_look(blogger_id: str, payload: CreateLookRequest, request: Requ
                 and primary_reference_image.strip()
             ):
                 reference_images = list(
-                    dict.fromkeys([*reference_images, primary_reference_image.strip()])
+                    dict.fromkeys([primary_reference_image.strip(), *reference_images])
                 )
         else:
             if not primary_reference_image:
