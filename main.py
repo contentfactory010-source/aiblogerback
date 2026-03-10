@@ -470,7 +470,7 @@ class CreateLookRequest(BaseModel):
     prompt: str = Field(min_length=1)
     referenceImage: str | None = None
     referenceImages: list[str] | None = None
-    includePrimaryReferenceImage: bool = False
+    includePrimaryReferenceImage: bool = True
 
 
 class CreateAssetRequest(BaseModel):
