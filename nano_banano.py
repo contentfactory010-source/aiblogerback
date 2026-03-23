@@ -596,6 +596,86 @@ async def _create_character_from_options(
     }
 
 
+async def create_image_generation_task(options: dict[str, Any]) -> dict[str, Any]:
+    prompt = str(options.get("prompt") or "").strip()
+    reference_images = [
+        str(item)
+        for item in (options.get("referenceImages") or [])
+        if isinstance(item, str) and item.strip()
+    ]
+
+    prepared_reference_images = (
+        await _ensure_public_input_urls([_to_public_url(item) for item in reference_images])
+        if reference_images
+        else []
+    )
+    if prepared_reference_images:
+        _assert_public_urls(prepared_reference_images)
+
+    task_id = await _create_nano_banano_task(
+        prompt=prompt,
+        aspect_ratio=str(options.get("aspectRatio") or "3:4"),
+        resolution=str(options.get("resolution") or "2K"),
+        output_format=str(options.get("outputFormat") or "png"),
+        model=str(options.get("model") or "nano-banana-2"),
+        image_input=prepared_reference_images or None,
+        google_search=bool(options.get("googleSearch")) if options.get("googleSearch") is not None else None,
+    )
+
+    return {
+        "id": task_id,
+        "status": "processing",
+        "preparedReferenceUrls": prepared_reference_images,
+    }
+
+
+async def get_image_generation_status(
+    task_id: str,
+    *,
+    prepared_reference_urls: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = await _fetch_task_record_info(task_id)
+    status = _extract_task_status(payload)
+    error = _extract_error_message(payload)
+
+    data = _as_record(_as_record(payload).get("data"))
+    success_flag_raw = data.get("successFlag")
+    try:
+        success_flag = int(success_flag_raw)
+    except Exception:
+        success_flag = None
+
+    is_done = status in {"success", "succeed", "done", "completed"} or success_flag == 1
+    is_failed = status in {"failed", "error", "cancelled", "canceled", "fail"} or success_flag in {2, 3}
+
+    if is_done:
+        forbidden = {
+            _normalize_url_for_compare(item)
+            for item in (prepared_reference_urls or [])
+            if isinstance(item, str) and item.strip()
+        }
+        image_url = _extract_image_url(payload, forbidden_urls=forbidden)
+        if not image_url:
+            details = json.dumps(payload, ensure_ascii=False)[:1200]
+            return {
+                "status": "failed",
+                "error": f"Image generation finished but output URL is missing. payload={details}",
+            }
+        local_image_path = await _download_image_to_server(image_url, task_id)
+        return {
+            "status": "done",
+            "outputUrl": local_image_path,
+        }
+
+    if is_failed:
+        return {
+            "status": "failed",
+            "error": error or "Image generation task failed",
+        }
+
+    return {"status": "processing"}
+
+
 async def _create_veo_task(params: dict[str, Any]) -> str:
     api_key = _get_api_key()
 

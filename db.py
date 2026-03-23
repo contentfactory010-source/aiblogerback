@@ -169,6 +169,29 @@ class SQLiteDB:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_stripe_checkouts_user_id ON stripe_checkouts(user_id)"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generation_jobs (
+                id TEXT PRIMARY KEY,
+                owner_user_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                target_id TEXT,
+                target_type TEXT,
+                external_task_id TEXT,
+                payload TEXT NOT NULL,
+                error TEXT,
+                result_url TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_generation_jobs_owner_user_id ON generation_jobs(owner_user_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_generation_jobs_status_created_at ON generation_jobs(status, created_at)"
+        )
 
         self._migrate_from_legacy_json(conn)
         conn.commit()
@@ -864,6 +887,270 @@ class SQLiteDB:
                 "balance": next_balance,
                 "credited": normalized_tokens,
                 "transactionId": transaction_id,
+            }
+
+    def create_generation_job(self, data: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            now = now_iso()
+            job = {
+                **data,
+                "id": nanoid(),
+                "status": str(data.get("status") or "queued"),
+                "createdAt": now,
+                "updatedAt": now,
+            }
+            conn.execute(
+                """
+                INSERT INTO generation_jobs (
+                    id,
+                    owner_user_id,
+                    kind,
+                    status,
+                    target_id,
+                    target_type,
+                    external_task_id,
+                    payload,
+                    error,
+                    result_url,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(job["id"]),
+                    str(job.get("ownerUserId") or ""),
+                    str(job.get("kind") or ""),
+                    str(job.get("status") or "queued"),
+                    str(job.get("targetId") or "") or None,
+                    str(job.get("targetType") or "") or None,
+                    str(job.get("externalTaskId") or "") or None,
+                    self._serialize(job.get("payload") if isinstance(job.get("payload"), dict) else {}),
+                    str(job.get("error") or "") or None,
+                    str(job.get("resultUrl") or "") or None,
+                    str(job["createdAt"]),
+                ),
+            )
+            conn.commit()
+            return job
+
+    def get_generation_job_by_id(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            row = conn.execute(
+                """
+                SELECT
+                    id,
+                    owner_user_id,
+                    kind,
+                    status,
+                    target_id,
+                    target_type,
+                    external_task_id,
+                    payload,
+                    error,
+                    result_url,
+                    created_at
+                FROM generation_jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            payload = self._deserialize(str(row["payload"] or "{}"))
+            created_at = str(row["created_at"] or now_iso())
+            return {
+                "id": str(row["id"] or ""),
+                "ownerUserId": str(row["owner_user_id"] or ""),
+                "kind": str(row["kind"] or ""),
+                "status": str(row["status"] or ""),
+                "targetId": str(row["target_id"] or ""),
+                "targetType": str(row["target_type"] or ""),
+                "externalTaskId": str(row["external_task_id"] or ""),
+                "payload": payload,
+                "error": str(row["error"] or ""),
+                "resultUrl": str(row["result_url"] or ""),
+                "createdAt": created_at,
+                "updatedAt": str(payload.get("updatedAt") or created_at),
+            }
+
+    def list_generation_jobs(
+        self,
+        *,
+        statuses: list[str] | None = None,
+        owner_user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        normalized_limit = max(1, min(int(limit), 1000))
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+
+            where_clauses: list[str] = []
+            params: list[Any] = []
+
+            if statuses:
+                normalized_statuses = [str(item).strip() for item in statuses if str(item).strip()]
+                if normalized_statuses:
+                    placeholders = ", ".join(["?"] * len(normalized_statuses))
+                    where_clauses.append(f"status IN ({placeholders})")
+                    params.extend(normalized_statuses)
+
+            if owner_user_id and owner_user_id.strip():
+                where_clauses.append("owner_user_id = ?")
+                params.append(owner_user_id.strip())
+
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            rows = conn.execute(
+                f"""
+                SELECT
+                    id,
+                    owner_user_id,
+                    kind,
+                    status,
+                    target_id,
+                    target_type,
+                    external_task_id,
+                    payload,
+                    error,
+                    result_url,
+                    created_at
+                FROM generation_jobs
+                {where_sql}
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (*params, normalized_limit),
+            ).fetchall()
+
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                payload = self._deserialize(str(row["payload"] or "{}"))
+                created_at = str(row["created_at"] or now_iso())
+                result.append(
+                    {
+                        "id": str(row["id"] or ""),
+                        "ownerUserId": str(row["owner_user_id"] or ""),
+                        "kind": str(row["kind"] or ""),
+                        "status": str(row["status"] or ""),
+                        "targetId": str(row["target_id"] or ""),
+                        "targetType": str(row["target_type"] or ""),
+                        "externalTaskId": str(row["external_task_id"] or ""),
+                        "payload": payload,
+                        "error": str(row["error"] or ""),
+                        "resultUrl": str(row["result_url"] or ""),
+                        "createdAt": created_at,
+                        "updatedAt": str(payload.get("updatedAt") or created_at),
+                    }
+                )
+            return result
+
+    def update_generation_job(self, job_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        with self._lock:
+            self._ensure_schema_and_migration()
+            conn = self._connect()
+            row = conn.execute(
+                """
+                SELECT
+                    id,
+                    owner_user_id,
+                    kind,
+                    status,
+                    target_id,
+                    target_type,
+                    external_task_id,
+                    payload,
+                    error,
+                    result_url,
+                    created_at
+                FROM generation_jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+
+            current_payload = self._deserialize(str(row["payload"] or "{}"))
+            next_payload = (
+                data["payload"]
+                if isinstance(data.get("payload"), dict)
+                else current_payload
+            )
+            if not isinstance(next_payload, dict):
+                next_payload = {}
+            next_payload = {
+                **next_payload,
+                "updatedAt": now_iso(),
+            }
+
+            next_status = str(data.get("status") or row["status"] or "queued")
+            next_target_id = (
+                str(data.get("targetId"))
+                if "targetId" in data
+                else str(row["target_id"] or "")
+            )
+            next_target_type = (
+                str(data.get("targetType"))
+                if "targetType" in data
+                else str(row["target_type"] or "")
+            )
+            next_external_task_id = (
+                str(data.get("externalTaskId"))
+                if "externalTaskId" in data
+                else str(row["external_task_id"] or "")
+            )
+            next_error = (
+                str(data.get("error"))
+                if "error" in data
+                else str(row["error"] or "")
+            )
+            next_result_url = (
+                str(data.get("resultUrl"))
+                if "resultUrl" in data
+                else str(row["result_url"] or "")
+            )
+
+            conn.execute(
+                """
+                UPDATE generation_jobs
+                SET
+                    status = ?,
+                    target_id = ?,
+                    target_type = ?,
+                    external_task_id = ?,
+                    payload = ?,
+                    error = ?,
+                    result_url = ?
+                WHERE id = ?
+                """,
+                (
+                    next_status,
+                    next_target_id or None,
+                    next_target_type or None,
+                    next_external_task_id or None,
+                    self._serialize(next_payload),
+                    next_error or None,
+                    next_result_url or None,
+                    job_id,
+                ),
+            )
+            conn.commit()
+            return {
+                "id": str(row["id"] or ""),
+                "ownerUserId": str(row["owner_user_id"] or ""),
+                "kind": str(row["kind"] or ""),
+                "status": next_status,
+                "targetId": next_target_id,
+                "targetType": next_target_type,
+                "externalTaskId": next_external_task_id,
+                "payload": next_payload,
+                "error": next_error,
+                "resultUrl": next_result_url,
+                "createdAt": str(row["created_at"] or now_iso()),
+                "updatedAt": str(next_payload.get("updatedAt") or now_iso()),
             }
 
 

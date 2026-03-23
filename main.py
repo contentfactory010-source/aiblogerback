@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import re
@@ -27,9 +28,9 @@ from .auth import (
 )
 from .db import db, nanoid
 from .nano_banano import (
-    create_character,
-    create_character_with_reference,
+    create_image_generation_task,
     generate_video,
+    get_image_generation_status,
     get_video_status,
 )
 from .settings import (
@@ -76,6 +77,10 @@ app.add_middleware(
 uploads_dir = PUBLIC_DIR / "uploads"
 uploads_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
+
+GENERATION_WORKER_POLL_SECONDS = 3
+GENERATION_WORKER_BATCH_SIZE = 20
+_generation_worker_task: asyncio.Task[None] | None = None
 
 
 def api_error(message: str, status: int = 400, **extra: Any) -> JSONResponse:
@@ -452,6 +457,467 @@ def is_owned_by_user(record: dict[str, Any] | None, user_id: str) -> bool:
     if not isinstance(record, dict):
         return False
     return str(record.get("ownerUserId") or "").strip() == user_id
+
+
+def _update_blogger_collection_item(
+    *,
+    blogger_id: str,
+    collection_key: Literal["looks", "clothes", "home", "cars", "relatives"],
+    item_id: str,
+    patch: dict[str, Any],
+) -> dict[str, Any] | None:
+    blogger = db.get_blogger_by_id(blogger_id)
+    if not blogger:
+        return None
+
+    collection = blogger.get(collection_key)
+    if not isinstance(collection, list):
+        return None
+
+    next_collection: list[dict[str, Any]] = []
+    found = False
+    for raw_item in collection:
+        item = as_record(raw_item)
+        current_id = str(item.get("id") or "").strip()
+        if current_id != item_id:
+            next_collection.append(item)
+            continue
+        found = True
+        next_collection.append(
+            {
+                **item,
+                **patch,
+                "id": item_id,
+            }
+        )
+
+    if not found:
+        return blogger
+    return db.update_blogger(blogger_id, {collection_key: next_collection})
+
+
+def _remove_blogger_collection_item(
+    *,
+    blogger_id: str,
+    collection_key: Literal["looks", "clothes", "home", "cars", "relatives"],
+    item_id: str,
+) -> dict[str, Any] | None:
+    blogger = db.get_blogger_by_id(blogger_id)
+    if not blogger:
+        return None
+
+    collection = blogger.get(collection_key)
+    if not isinstance(collection, list):
+        return None
+
+    next_collection = [
+        as_record(item)
+        for item in collection
+        if str(as_record(item).get("id") or "").strip() != item_id
+    ]
+    return db.update_blogger(blogger_id, {collection_key: next_collection})
+
+
+def _refund_generation_job_tokens_if_needed(job: dict[str, Any], *, reason: str) -> dict[str, Any] | None:
+    payload = as_record(job.get("payload"))
+    if payload.get("refundIssued"):
+        return job
+
+    amount = as_positive_int(payload.get("chargedTokens"), fallback=0)
+    user_id = str(job.get("ownerUserId") or "").strip()
+    if amount > 0 and user_id:
+        db.credit_user_tokens(
+            user_id=user_id,
+            amount=amount,
+            reason=reason,
+            metadata={
+                "operation": "generation_refund",
+                "jobId": str(job.get("id") or ""),
+                "kind": str(job.get("kind") or ""),
+                "targetType": str(job.get("targetType") or ""),
+                "targetId": str(job.get("targetId") or ""),
+            },
+        )
+
+    next_payload = {
+        **payload,
+        "refundIssued": True,
+    }
+    return db.update_generation_job(
+        str(job.get("id") or ""),
+        {
+            "payload": next_payload,
+        },
+    )
+
+
+def _mark_generation_job_failed(
+    job: dict[str, Any],
+    *,
+    error: str,
+    refund_tokens: bool = False,
+) -> dict[str, Any] | None:
+    next_job = job
+    if refund_tokens:
+        refunded = _refund_generation_job_tokens_if_needed(job, reason="refund_generation_failed")
+        if refunded:
+            next_job = refunded
+
+    return db.update_generation_job(
+        str(job.get("id") or ""),
+        {
+            "status": "failed",
+            "error": error,
+        },
+    )
+
+
+def _mark_image_job_target_failed(
+    *,
+    kind: str,
+    target_id: str,
+    payload: dict[str, Any],
+    error_message: str,
+) -> None:
+    blogger_id = str(payload.get("bloggerId") or "").strip()
+    if kind == "look":
+        if blogger_id and target_id:
+            _update_blogger_collection_item(
+                blogger_id=blogger_id,
+                collection_key="looks",
+                item_id=target_id,
+                patch={"status": "failed", "error": error_message},
+            )
+        return
+
+    if kind == "asset":
+        collection_key = str(payload.get("collectionKey") or "").strip()
+        if blogger_id and target_id and collection_key in {"clothes", "home", "cars", "relatives"}:
+            _update_blogger_collection_item(
+                blogger_id=blogger_id,
+                collection_key=collection_key,  # type: ignore[arg-type]
+                item_id=target_id,
+                patch={"status": "failed", "error": error_message},
+            )
+        return
+
+    if kind == "blogger_base_image" and blogger_id:
+        db.update_blogger(
+            blogger_id,
+            {
+                "baseImageStatus": "failed",
+                "baseImageError": error_message,
+            },
+        )
+
+
+async def _start_generation_job(job: dict[str, Any]) -> None:
+    job_id = str(job.get("id") or "").strip()
+    if not job_id:
+        return
+
+    kind = str(job.get("kind") or "").strip()
+    target_id = str(job.get("targetId") or "").strip()
+    payload = as_record(job.get("payload"))
+
+    if kind == "video":
+        try:
+            generation_result = await generate_video(payload)
+        except Exception as exc:
+            if target_id:
+                db.update_video(
+                    target_id,
+                    {
+                        "status": "failed",
+                        "error": str(exc),
+                    },
+                )
+            _mark_generation_job_failed(job, error=str(exc), refund_tokens=True)
+            return
+
+        external_task_id = str(generation_result.get("id") or "").strip()
+        if not external_task_id:
+            error = str(generation_result.get("error") or "Video generation task id is missing")
+            if target_id:
+                db.update_video(
+                    target_id,
+                    {
+                        "status": "failed",
+                        "error": error,
+                    },
+                )
+            _mark_generation_job_failed(job, error=error, refund_tokens=True)
+            return
+
+        if target_id:
+            db.update_video(
+                target_id,
+                {
+                    "externalTaskId": external_task_id,
+                    "status": "processing",
+                    "error": None,
+                },
+            )
+        db.update_generation_job(
+            job_id,
+            {
+                "status": "processing",
+                "externalTaskId": external_task_id,
+                "error": "",
+            },
+        )
+        return
+
+    if kind in {"look", "asset", "blogger_base_image"}:
+        try:
+            generation_result = await create_image_generation_task(payload)
+        except Exception as exc:
+            error_message = str(exc)
+            _mark_image_job_target_failed(
+                kind=kind,
+                target_id=target_id,
+                payload=payload,
+                error_message=error_message,
+            )
+            _mark_generation_job_failed(job, error=error_message, refund_tokens=True)
+            return
+
+        external_task_id = str(generation_result.get("id") or "").strip()
+        if not external_task_id:
+            error = "Image generation task id is missing"
+            _mark_image_job_target_failed(
+                kind=kind,
+                target_id=target_id,
+                payload=payload,
+                error_message=error,
+            )
+            _mark_generation_job_failed(job, error=error, refund_tokens=True)
+            return
+
+        prepared_reference_urls = [
+            str(item)
+            for item in (generation_result.get("preparedReferenceUrls") or [])
+            if isinstance(item, str) and item.strip()
+        ]
+        next_payload = {
+            **payload,
+            "preparedReferenceUrls": prepared_reference_urls,
+        }
+
+        db.update_generation_job(
+            job_id,
+            {
+                "status": "processing",
+                "externalTaskId": external_task_id,
+                "payload": next_payload,
+                "error": "",
+            },
+        )
+        return
+
+    _mark_generation_job_failed(job, error=f"Unsupported generation job kind: {kind}", refund_tokens=False)
+
+
+async def _refresh_generation_job(job: dict[str, Any]) -> None:
+    job_id = str(job.get("id") or "").strip()
+    if not job_id:
+        return
+
+    kind = str(job.get("kind") or "").strip()
+    target_id = str(job.get("targetId") or "").strip()
+    external_task_id = str(job.get("externalTaskId") or "").strip()
+    payload = as_record(job.get("payload"))
+    blogger_id = str(payload.get("bloggerId") or "").strip()
+
+    if not external_task_id:
+        _mark_generation_job_failed(
+            job,
+            error="Generation task is missing externalTaskId",
+            refund_tokens=True,
+        )
+        return
+
+    if kind == "video":
+        video_type = str(payload.get("type") or "")
+        try:
+            status = await get_video_status(external_task_id, video_type)
+        except Exception:
+            # Temporary upstream/network issue: keep processing.
+            return
+
+        normalized_status = str(status.get("status") or "").strip().lower()
+        if normalized_status == "done":
+            if target_id:
+                db.update_video(
+                    target_id,
+                    {
+                        "status": "done",
+                        "outputUrl": status.get("outputUrl"),
+                        "error": None,
+                    },
+                )
+            db.update_generation_job(
+                job_id,
+                {
+                    "status": "done",
+                    "resultUrl": str(status.get("outputUrl") or ""),
+                    "error": "",
+                },
+            )
+            return
+
+        if normalized_status == "failed":
+            error_message = str(status.get("error") or "Video generation failed")
+            if target_id:
+                db.update_video(
+                    target_id,
+                    {
+                        "status": "failed",
+                        "error": error_message,
+                    },
+                )
+            _mark_generation_job_failed(job, error=error_message, refund_tokens=True)
+            return
+        return
+
+    if kind in {"look", "asset", "blogger_base_image"}:
+        prepared_reference_urls = [
+            str(item)
+            for item in (payload.get("preparedReferenceUrls") or [])
+            if isinstance(item, str) and item.strip()
+        ]
+        try:
+            status = await get_image_generation_status(
+                external_task_id,
+                prepared_reference_urls=prepared_reference_urls,
+            )
+        except Exception:
+            # Temporary upstream/network issue: keep processing.
+            return
+
+        normalized_status = str(status.get("status") or "").strip().lower()
+        if normalized_status == "done":
+            output_url = str(status.get("outputUrl") or "").strip()
+            if kind == "look" and blogger_id and target_id:
+                _update_blogger_collection_item(
+                    blogger_id=blogger_id,
+                    collection_key="looks",
+                    item_id=target_id,
+                    patch={
+                        "imageRef": output_url,
+                        "status": "done",
+                        "error": None,
+                    },
+                )
+            elif kind == "asset":
+                collection_key = str(payload.get("collectionKey") or "").strip()
+                if blogger_id and target_id and collection_key in {"clothes", "home", "cars", "relatives"}:
+                    _update_blogger_collection_item(
+                        blogger_id=blogger_id,
+                        collection_key=collection_key,  # type: ignore[arg-type]
+                        item_id=target_id,
+                        patch={
+                            "imageRef": output_url,
+                            "status": "done",
+                            "error": None,
+                        },
+                    )
+            elif kind == "blogger_base_image" and blogger_id:
+                db.update_blogger(
+                    blogger_id,
+                    {
+                        "nanoBananoId": external_task_id,
+                        "baseImage": output_url,
+                        "baseImageStatus": "done",
+                        "baseImageError": "",
+                    },
+                )
+
+            db.update_generation_job(
+                job_id,
+                {
+                    "status": "done",
+                    "resultUrl": output_url,
+                    "error": "",
+                },
+            )
+            return
+
+        if normalized_status == "failed":
+            error_message = str(status.get("error") or "Image generation failed")
+            if kind == "look" and blogger_id and target_id:
+                _update_blogger_collection_item(
+                    blogger_id=blogger_id,
+                    collection_key="looks",
+                    item_id=target_id,
+                    patch={"status": "failed", "error": error_message},
+                )
+            elif kind == "asset":
+                collection_key = str(payload.get("collectionKey") or "").strip()
+                if blogger_id and target_id and collection_key in {"clothes", "home", "cars", "relatives"}:
+                    _update_blogger_collection_item(
+                        blogger_id=blogger_id,
+                        collection_key=collection_key,  # type: ignore[arg-type]
+                        item_id=target_id,
+                        patch={"status": "failed", "error": error_message},
+                    )
+            elif kind == "blogger_base_image" and blogger_id:
+                db.update_blogger(
+                    blogger_id,
+                    {
+                        "baseImageStatus": "failed",
+                        "baseImageError": error_message,
+                    },
+                )
+            _mark_generation_job_failed(job, error=error_message, refund_tokens=True)
+            return
+        return
+
+    _mark_generation_job_failed(job, error=f"Unsupported generation job kind: {kind}", refund_tokens=False)
+
+
+async def _generation_worker_loop() -> None:
+    while True:
+        try:
+            queued_jobs = db.list_generation_jobs(
+                statuses=["queued"],
+                limit=GENERATION_WORKER_BATCH_SIZE,
+            )
+            for job in queued_jobs:
+                await _start_generation_job(job)
+
+            processing_jobs = db.list_generation_jobs(
+                statuses=["processing"],
+                limit=GENERATION_WORKER_BATCH_SIZE,
+            )
+            for job in processing_jobs:
+                await _refresh_generation_job(job)
+        except Exception:
+            # Keep worker alive even if one cycle fails unexpectedly.
+            pass
+
+        await asyncio.sleep(GENERATION_WORKER_POLL_SECONDS)
+
+
+@app.on_event("startup")
+async def start_generation_worker() -> None:
+    global _generation_worker_task
+    if _generation_worker_task is None or _generation_worker_task.done():
+        _generation_worker_task = asyncio.create_task(_generation_worker_loop())
+
+
+@app.on_event("shutdown")
+async def stop_generation_worker() -> None:
+    global _generation_worker_task
+    if _generation_worker_task is None:
+        return
+    _generation_worker_task.cancel()
+    try:
+        await _generation_worker_task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _generation_worker_task = None
 
 
 class CreateBloggerRequest(BaseModel):
@@ -1295,44 +1761,45 @@ async def create_blogger_in_nano(
     try:
         reference_image = payload.referenceImage if payload else None
 
-        result = (
-            await create_character_with_reference(
-                {
-                    "prompt": blogger.get("prompt", ""),
-                    "referenceImages": [reference_image],
-                    "aspectRatio": "3:4",
-                    "resolution": "2K",
-                    "outputFormat": "png",
-                    "googleSearch": False,
-                }
-            )
-            if reference_image
-            else await create_character(str(blogger.get("prompt", "")))
-        )
-
-        if not result.get("success"):
-            if reserved:
-                refund_reserved_tokens(reserved, reason="refund_generation_failed")
-            return api_error(
-                result.get("error") or "Failed to create character in Nano Banano",
-                status=500,
-            )
-
-        base_image = result.get("imageUrl") or blogger.get("baseImage")
         db.update_blogger(
             blogger_id,
             {
-                "nanoBananoId": result.get("id"),
-                "baseImage": base_image,
+                "baseImageStatus": "processing",
+                "baseImageError": "",
             },
         )
 
+        job_payload: dict[str, Any] = {
+            "bloggerId": blogger_id,
+            "prompt": str(blogger.get("prompt") or ""),
+            "referenceImages": [reference_image] if reference_image else [],
+            "aspectRatio": "3:4",
+            "resolution": "2K",
+            "outputFormat": "png",
+            "googleSearch": False,
+            "chargedTokens": max(1, TOKEN_COST_PHOTO),
+            "refundIssued": False,
+        }
+        job = db.create_generation_job(
+            {
+                "ownerUserId": user_id,
+                "kind": "blogger_base_image",
+                "status": "queued",
+                "targetId": blogger_id,
+                "targetType": "blogger",
+                "payload": job_payload,
+            }
+        )
+
+        fresh_blogger = db.get_blogger_by_id(blogger_id) or blogger
         return with_public_upload_urls(
             {
-            "success": True,
-            "nanoBananoId": result.get("id"),
-            "baseImage": base_image,
-            "tokenBalance": db.ensure_user_token_balance(user_id),
+                "success": True,
+                "status": "processing",
+                "jobId": job.get("id"),
+                "baseImage": fresh_blogger.get("baseImage"),
+                "baseImageStatus": fresh_blogger.get("baseImageStatus"),
+                "tokenBalance": db.ensure_user_token_balance(user_id),
             },
             request_origin(request),
         )
@@ -1399,35 +1866,63 @@ async def create_look(blogger_id: str, payload: CreateLookRequest, request: Requ
         if reserve_error:
             return reserve_error
 
-        generated = await create_character_with_reference(
-            {
-                "prompt": payload.prompt,
-                "referenceImages": reference_images,
-                "aspectRatio": "auto",
-                "googleSearch": False,
-                "resolution": "1K",
-                "outputFormat": "jpg",
-            }
-        )
-
-        if not generated.get("success") or not generated.get("imageUrl"):
-            if reserved:
-                refund_reserved_tokens(reserved, reason="refund_generation_failed")
-            return api_error(
-                generated.get("error") or "Failed to generate look image",
-                status=500,
-            )
-
+        look_id = f"look_{nanoid(8)}"
         next_looks = [
             *(blogger.get("looks") or []),
             {
-                "id": f"look_{nanoid(8)}",
+                "id": look_id,
                 "name": payload.name.strip(),
-                "imageRef": generated.get("imageUrl"),
+                "imageRef": "",
+                "status": "processing",
+                "error": None,
             },
         ]
 
         updated = db.update_blogger(blogger_id, {"looks": next_looks})
+        if not updated:
+            if reserved:
+                refund_reserved_tokens(reserved, reason="refund_generation_failed")
+            return api_error("Failed to queue look generation", status=500)
+
+        try:
+            job = db.create_generation_job(
+                {
+                    "ownerUserId": user_id,
+                    "kind": "look",
+                    "status": "queued",
+                    "targetId": look_id,
+                    "targetType": "look",
+                    "payload": {
+                        "bloggerId": blogger_id,
+                        "collectionKey": "looks",
+                        "prompt": payload.prompt,
+                        "referenceImages": reference_images,
+                        "aspectRatio": "auto",
+                        "googleSearch": False,
+                        "resolution": "1K",
+                        "outputFormat": "jpg",
+                        "chargedTokens": max(1, TOKEN_COST_PHOTO),
+                        "refundIssued": False,
+                    },
+                }
+            )
+            _update_blogger_collection_item(
+                blogger_id=blogger_id,
+                collection_key="looks",
+                item_id=look_id,
+                patch={"generationJobId": job.get("id")},
+            )
+        except Exception as exc:
+            _remove_blogger_collection_item(
+                blogger_id=blogger_id,
+                collection_key="looks",
+                item_id=look_id,
+            )
+            if reserved:
+                refund_reserved_tokens(reserved, reason="refund_generation_failed")
+            return api_error(f"Failed to queue look generation: {exc}", status=500)
+
+        updated = db.get_blogger_by_id(blogger_id) or updated
         response_payload = with_public_upload_urls(updated, request_origin(request))
         if isinstance(response_payload, dict):
             response_payload["tokenBalance"] = db.ensure_user_token_balance(user_id)
@@ -1469,29 +1964,88 @@ async def create_asset(blogger_id: str, payload: CreateAssetRequest, request: Re
             return reserve_error
 
     try:
-        image_ref = (
-            str(payload.imageUrl)
-            if payload.action == "upload"
-            else (await create_character(str(payload.prompt or ""))).get("imageUrl")
-        )
-        if not image_ref:
-            if reserved:
-                refund_reserved_tokens(reserved, reason="refund_generation_failed")
-            return api_error("Не удалось получить изображение", status=500)
-
         collection = blogger.get(payload.category)
         if not isinstance(collection, list):
             collection = []
+
+        if payload.action == "upload":
+            image_ref = str(payload.imageUrl or "").strip()
+            if not image_ref:
+                return api_error("Не удалось получить изображение", status=500)
+
+            next_collection = [
+                *collection,
+                {
+                    "id": f"asset_{nanoid(8)}",
+                    "name": payload.name.strip(),
+                    "imageRef": image_ref,
+                    "status": "done",
+                    "error": None,
+                },
+            ]
+
+            updated = db.update_blogger(blogger_id, {payload.category: next_collection})
+            response_payload = with_public_upload_urls(updated, request_origin(request))
+            if isinstance(response_payload, dict):
+                response_payload["tokenBalance"] = db.ensure_user_token_balance(user_id)
+            return response_payload
+
+        asset_id = f"asset_{nanoid(8)}"
         next_collection = [
             *collection,
             {
-                "id": f"asset_{nanoid(8)}",
+                "id": asset_id,
                 "name": payload.name.strip(),
-                "imageRef": image_ref,
+                "imageRef": "",
+                "status": "processing",
+                "error": None,
             },
         ]
-
         updated = db.update_blogger(blogger_id, {payload.category: next_collection})
+        if not updated:
+            if reserved:
+                refund_reserved_tokens(reserved, reason="refund_generation_failed")
+            return api_error("Failed to queue asset generation", status=500)
+
+        try:
+            job = db.create_generation_job(
+                {
+                    "ownerUserId": user_id,
+                    "kind": "asset",
+                    "status": "queued",
+                    "targetId": asset_id,
+                    "targetType": "asset",
+                    "payload": {
+                        "bloggerId": blogger_id,
+                        "collectionKey": payload.category,
+                        "prompt": str(payload.prompt or ""),
+                        "referenceImages": [],
+                        "aspectRatio": "3:4",
+                        "googleSearch": False,
+                        "resolution": "2K",
+                        "outputFormat": "png",
+                        "chargedTokens": max(1, TOKEN_COST_PHOTO),
+                        "refundIssued": False,
+                    },
+                }
+            )
+            _update_blogger_collection_item(
+                blogger_id=blogger_id,
+                collection_key=payload.category,
+                item_id=asset_id,
+                patch={"generationJobId": job.get("id")},
+            )
+        except Exception as exc:
+            _remove_blogger_collection_item(
+                blogger_id=blogger_id,
+                collection_key=payload.category,
+                item_id=asset_id,
+            )
+            if reserved:
+                refund_reserved_tokens(reserved, reason="refund_generation_failed")
+            return api_error(f"Failed to queue asset generation: {exc}", status=500)
+
+        updated = db.get_blogger_by_id(blogger_id) or updated
         response_payload = with_public_upload_urls(updated, request_origin(request))
         if isinstance(response_payload, dict):
             response_payload["tokenBalance"] = db.ensure_user_token_balance(user_id)
@@ -1591,41 +2145,48 @@ async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
         if reserve_error:
             return reserve_error
 
-        nb_result = await generate_video(
-            {
-                "bloggerId": payload.bloggerId,
-                "type": payload.type,
-                "prompt": trimmed_prompt or None,
-                "lookId": payload.lookId,
-                "referenceImage": resolved_reference_image,
-                "aspectRatio": "Auto" if payload.type == "ugc" else payload.aspectRatio,
-                "imageUrls": resolved_image_urls,
-                "videoUrls": payload.videoUrls,
-                "audioUrls": payload.audioUrls,
-                "motionOrientation": payload.motionOrientation,
-                "motionMode": payload.motionMode,
-            }
-        )
-
         video = db.create_video(
             {
-                "externalTaskId": nb_result.get("id"),
+                "externalTaskId": None,
                 "bloggerId": payload.bloggerId,
                 "ownerUserId": user_id,
                 "type": payload.type,
                 "prompt": trimmed_prompt,
                 "lookId": payload.lookId,
-                "status": nb_result.get("status"),
-                "outputUrl": nb_result.get("outputUrl"),
+                "status": "processing",
+                "outputUrl": None,
             }
         )
-        if not str(nb_result.get("id") or "").strip() and str(nb_result.get("status") or "").lower() == "failed":
+        try:
+            db.create_generation_job(
+                {
+                    "ownerUserId": user_id,
+                    "kind": "video",
+                    "status": "queued",
+                    "targetId": str(video.get("id") or ""),
+                    "targetType": "video",
+                    "payload": {
+                        "bloggerId": payload.bloggerId,
+                        "type": payload.type,
+                        "prompt": trimmed_prompt or None,
+                        "lookId": payload.lookId,
+                        "referenceImage": resolved_reference_image,
+                        "aspectRatio": "Auto" if payload.type == "ugc" else payload.aspectRatio,
+                        "imageUrls": resolved_image_urls,
+                        "videoUrls": payload.videoUrls,
+                        "audioUrls": payload.audioUrls,
+                        "motionOrientation": payload.motionOrientation,
+                        "motionMode": payload.motionMode,
+                        "chargedTokens": video_token_cost,
+                        "refundIssued": False,
+                    },
+                }
+            )
+        except Exception as exc:
+            db.delete_video(str(video.get("id") or ""))
             if reserved:
                 refund_reserved_tokens(reserved, reason="refund_generation_failed")
-            return api_error(
-                str(nb_result.get("error") or "Не удалось создать видео"),
-                status=500,
-            )
+            return api_error(f"Failed to queue video generation: {exc}", status=500)
 
         response_payload = with_public_upload_urls(video, request_origin(request))
         if isinstance(response_payload, dict):
