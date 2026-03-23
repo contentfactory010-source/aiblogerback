@@ -483,13 +483,15 @@ class CreateAssetRequest(BaseModel):
 
 class CreateVideoRequest(BaseModel):
     bloggerId: str = Field(min_length=1)
-    type: Literal["motion_control", "ugc", "custom"]
+    type: Literal["motion_control", "ugc", "lipsync", "custom"]
     prompt: str | None = None
     lookId: str | None = None
     referenceImage: str | None = None
     imageUrls: list[str] | None = None
     videoUrls: list[str] | None = None
+    audioUrls: list[str] | None = None
     motionDurationSeconds: float | None = None
+    lipSyncDurationSeconds: float | None = None
     motionOrientation: Literal["video", "image"] | None = None
     motionMode: Literal["720p", "1080p"] | None = None
     aspectRatio: Literal["16:9", "9:16", "Auto"] | None = None
@@ -1554,8 +1556,23 @@ async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
                     status=400,
                 )
             video_token_cost = max(1, int(math.ceil(motion_duration_seconds)))
+            lip_sync_duration_seconds = None
+        elif payload.type == "lipsync":
+            if not payload.audioUrls or len(payload.audioUrls) == 0:
+                return api_error("Для Lip Sync нужно передать входящее аудио", status=400)
+            if not resolved_image_urls or len(resolved_image_urls) == 0:
+                return api_error("Для Lip Sync нужно передать входящее изображение", status=400)
+            lip_sync_duration_seconds = float(payload.lipSyncDurationSeconds or 0)
+            if not math.isfinite(lip_sync_duration_seconds) or lip_sync_duration_seconds <= 0:
+                return api_error(
+                    "Для Lip Sync нужно передать корректную длительность аудио в секундах",
+                    status=400,
+                )
+            video_token_cost = max(1, int(math.ceil(lip_sync_duration_seconds)))
+            motion_duration_seconds = None
         else:
             motion_duration_seconds = None
+            lip_sync_duration_seconds = None
             video_token_cost = max(1, TOKEN_COST_VIDEO)
 
         reserved, reserve_error = reserve_tokens_for_generation(
@@ -1567,6 +1584,7 @@ async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
                 "bloggerId": payload.bloggerId,
                 "videoType": payload.type,
                 "motionDurationSeconds": motion_duration_seconds,
+                "lipSyncDurationSeconds": lip_sync_duration_seconds,
                 "chargedTokens": video_token_cost,
             },
         )
@@ -1583,6 +1601,7 @@ async def create_video(payload: CreateVideoRequest, request: Request) -> Any:
                 "aspectRatio": "Auto" if payload.type == "ugc" else payload.aspectRatio,
                 "imageUrls": resolved_image_urls,
                 "videoUrls": payload.videoUrls,
+                "audioUrls": payload.audioUrls,
                 "motionOrientation": payload.motionOrientation,
                 "motionMode": payload.motionMode,
             }
@@ -1672,6 +1691,19 @@ ALLOWED_VIDEO_TYPES = {
 }
 
 
+ALLOWED_AUDIO_TYPES = {
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/wave",
+    "audio/ogg",
+    "audio/webm",
+    "audio/mp4",
+    "audio/x-m4a",
+}
+
+
 @app.get("/api/trend-videos")
 async def get_trend_videos(request: Request) -> list[dict[str, str]]:
     trends_dir = PUBLIC_DIR / "uploads" / "trends"
@@ -1706,6 +1738,20 @@ def extension_from_mime_type(mime_type: str) -> str:
     if mime_type == "video/x-m4v":
         return "m4v"
     return "mp4"
+
+
+def extension_from_audio_mime_type(mime_type: str) -> str:
+    if mime_type in {"audio/mpeg", "audio/mp3"}:
+        return "mp3"
+    if mime_type in {"audio/wav", "audio/x-wav", "audio/wave"}:
+        return "wav"
+    if mime_type == "audio/ogg":
+        return "ogg"
+    if mime_type == "audio/webm":
+        return "webm"
+    if mime_type in {"audio/mp4", "audio/x-m4a"}:
+        return "m4a"
+    return "mp3"
 
 
 ALLOWED_IMAGE_TYPES = {
@@ -1787,6 +1833,31 @@ async def upload_video(request: Request, file: UploadFile | None = File(default=
         file_path.write_bytes(await file.read())
 
         return {"url": f"{request_origin(request)}/uploads/motion/{safe_name}"}
+    except Exception as exc:
+        return api_error(f"Upload failed: {exc}", status=500)
+
+
+@app.post("/api/upload-audio")
+async def upload_audio(request: Request, file: UploadFile | None = File(default=None)) -> Any:
+    if file is None:
+        return api_error("File is required", status=400)
+
+    if file.content_type not in ALLOWED_AUDIO_TYPES:
+        return api_error(
+            "Unsupported audio type. Allowed: audio/mpeg, audio/mp3, audio/wav, audio/x-wav, audio/wave, audio/ogg, audio/webm, audio/mp4, audio/x-m4a",
+            status=400,
+        )
+
+    try:
+        uploads_audio_dir = PUBLIC_DIR / "uploads" / "audio"
+        uploads_audio_dir.mkdir(parents=True, exist_ok=True)
+
+        ext = extension_from_audio_mime_type(file.content_type or "")
+        safe_name = f"{int(time.time() * 1000)}_{nanoid(8)}.{ext}"
+        file_path = uploads_audio_dir / safe_name
+        file_path.write_bytes(await file.read())
+
+        return {"url": f"{request_origin(request)}/uploads/audio/{safe_name}"}
     except Exception as exc:
         return api_error(f"Upload failed: {exc}", status=500)
 

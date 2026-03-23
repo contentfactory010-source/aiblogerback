@@ -348,7 +348,7 @@ def _extract_video_url(payload: Any) -> str | None:
     return None
 
 
-def _extract_motion_control_output_url(payload: Any) -> str | None:
+def _extract_record_info_output_url(payload: Any) -> str | None:
     result_json_raw = _get_string_by_paths(
         payload,
         [
@@ -381,6 +381,9 @@ def _extract_motion_control_output_url(payload: Any) -> str | None:
         return direct
 
     urls = _collect_http_urls(parsed)
+    for url in urls:
+        if _looks_like_video_url(url):
+            return url
     return urls[0] if urls else None
 
 
@@ -719,6 +722,74 @@ async def _create_motion_control_task(params: dict[str, Any]) -> str:
     return task_id
 
 
+async def _create_lipsync_task(params: dict[str, Any]) -> str:
+    api_key = _get_api_key()
+
+    source_image_urls: list[str] = []
+    image_urls = params.get("imageUrls")
+    if isinstance(image_urls, list):
+        source_image_urls = [str(item) for item in image_urls if isinstance(item, str) and item.strip()]
+    if not source_image_urls and isinstance(params.get("referenceImage"), str):
+        source_image_urls = [str(params["referenceImage"])]
+
+    source_audio_urls: list[str] = []
+    audio_urls = params.get("audioUrls")
+    if isinstance(audio_urls, list):
+        source_audio_urls = [str(item) for item in audio_urls if isinstance(item, str) and item.strip()]
+
+    if not source_image_urls:
+        raise RuntimeError("Lip sync requires at least one input image URL")
+    if not source_audio_urls:
+        raise RuntimeError("Lip sync requires at least one input audio URL")
+
+    prepared_image_urls = await _ensure_public_input_urls([_to_public_url(item) for item in source_image_urls])
+    prepared_audio_urls = await _ensure_public_input_urls([_to_public_url(item) for item in source_audio_urls])
+    _assert_public_urls(prepared_image_urls)
+    _assert_public_urls(prepared_audio_urls)
+
+    input_payload: dict[str, Any] = {
+        "image_url": prepared_image_urls[0],
+        "audio_url": prepared_audio_urls[0],
+    }
+    prompt = str(params.get("prompt") or "").strip()
+    if prompt:
+        input_payload["prompt"] = prompt
+
+    body: dict[str, Any] = {
+        "model": "kling/ai-avatar-pro",
+        "input": input_payload,
+    }
+    if NANO_BANANO_CALLBACK_URL:
+        body["callBackUrl"] = NANO_BANANO_CALLBACK_URL
+
+    response = await _request_with_retry(
+        "POST",
+        f"{NANO_BANANO_BASE_URL}/jobs/createTask",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json_payload=body,
+    )
+    payload = _parse_payload(response)
+
+    if response.status_code >= 400:
+        details = _extract_error_message(payload) or json.dumps(payload, ensure_ascii=False)
+        raise RuntimeError(
+            f"Kie Lip Sync API error: {response.status_code} {response.reason_phrase} - {details}"
+        )
+
+    code = _as_record(payload).get("code")
+    if isinstance(code, (int, float)) and int(code) != 200:
+        details = _extract_error_message(payload) or _get_string_by_paths(payload, [["msg"]]) or json.dumps(payload)
+        raise RuntimeError(f"Kie Lip Sync task rejected: {details}")
+
+    task_id = _extract_task_id(payload)
+    if not task_id:
+        raise RuntimeError(f"Lip Sync response does not contain task id. payload={json.dumps(payload)[:1000]}")
+    return task_id
+
+
 async def create_character(prompt: str) -> dict[str, Any]:
     return await _create_character_from_options(
         prompt=prompt,
@@ -741,11 +812,12 @@ async def create_character_with_reference(options: dict[str, Any]) -> dict[str, 
 
 async def generate_video(params: dict[str, Any]) -> dict[str, Any]:
     video_type = str(params.get("type") or "")
-    external_id = (
-        await _create_motion_control_task(params)
-        if video_type == "motion_control"
-        else await _create_veo_task(params)
-    )
+    if video_type == "motion_control":
+        external_id = await _create_motion_control_task(params)
+    elif video_type == "lipsync":
+        external_id = await _create_lipsync_task(params)
+    else:
+        external_id = await _create_veo_task(params)
 
     return {
         "id": external_id or f"nb_video_{int(time.time() * 1000)}",
@@ -755,16 +827,17 @@ async def generate_video(params: dict[str, Any]) -> dict[str, Any]:
 
 
 async def get_video_status(external_id: str, video_type: str) -> dict[str, Any]:
-    if video_type == "motion_control":
+    if video_type in {"motion_control", "lipsync"}:
         payload = await _fetch_task_record_info(external_id)
         status = _extract_task_status(payload)
         error = _extract_error_message(payload)
-        output_url = _extract_motion_control_output_url(payload) or _extract_video_url(payload)
+        output_url = _extract_record_info_output_url(payload) or _extract_video_url(payload)
+        failed_reason = "Lip sync task failed" if video_type == "lipsync" else "Motion control task failed"
 
         if status in {"success", "succeed", "done", "completed"}:
             return {"status": "done", "outputUrl": output_url}
         if status in {"failed", "error", "cancelled", "canceled"}:
-            return {"status": "failed", "error": error or "Motion control task failed"}
+            return {"status": "failed", "error": error or failed_reason}
 
         data = _as_record(_as_record(payload).get("data"))
         success_flag_raw = data.get("successFlag")
@@ -776,7 +849,7 @@ async def get_video_status(external_id: str, video_type: str) -> dict[str, Any]:
         if success_flag == 1:
             return {"status": "done", "outputUrl": output_url}
         if success_flag in {2, 3}:
-            return {"status": "failed", "error": error or "Motion control task failed"}
+            return {"status": "failed", "error": error or failed_reason}
 
         return {"status": "processing"}
 
